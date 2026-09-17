@@ -34,3 +34,28 @@ ALLOWED_SUFFIXES = {
     ".md",
     ".csv",
 }
+
+# Billing
+BILLING_DB_PATH = Path(
+    os.getenv("BILLING_DB_PATH", str(ROOT / "data" / "billing.sqlite3"))
+)
+BILLING_HTTP_HOST = os.getenv("BILLING_HTTP_HOST", "0.0.0.0").strip()
+BILLING_HTTP_PORT = int(os.getenv("BILLING_HTTP_PORT", "8088"))
+BILLING_PUBLIC_BASE_URL = os.getenv("BILLING_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+UNITPAY_PROJECT_ID = os.getenv("UNITPAY_PROJECT_ID", "").strip()
+UNITPAY_SECRET_KEY = os.getenv("UNITPAY_SECRET_KEY", "").strip()
+UNITPAY_PUBLIC_KEY = os.getenv("UNITPAY_PUBLIC_KEY", "").strip()
+UNITPAY_SKIP_IP_CHECK = os.getenv("UNITPAY_SKIP_IP_CHECK", "").strip() in {
+    "1",
+    "true",
+    "yes",
+}
+
+# Optional admin telegram ids for test grants: "123,456"
+_ADMIN_RAW = os.getenv("BILLING_ADMIN_IDS", "").strip()
+BILLING_ADMIN_IDS = {
+    int(x) for x in _ADMIN_RAW.replace(" ", "").split(",") if x.isdigit()
+}
+
+STARS_SUBSCRIPTION_PERIOD = 30 * 24 * 60 * 60  # 2592000

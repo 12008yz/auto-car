@@ -15,6 +15,9 @@ from aiogram.types import (
     User,
 )
 
+from billing.pay import upsell_keyboard
+from billing.service import ConsumeResult, consume, ensure_user, refund_consume
+from billing.skus import Action
 from bot.session import PendingEdit, UserSession, get_session
 from card.render import render_product_card
 from config import ALLOWED_SUFFIXES, DATA_DIR, IMAGE_SUFFIXES, MAX_FILE_BYTES, TELEGRAM_MAX_LEN
@@ -40,8 +43,11 @@ HELP_TEXT = (
     "/summary — краткое содержание активного файла\n"
     "/files — список загруженных файлов\n"
     "/use имя_файла — сделать файл активным\n"
+    "/plans — тарифы\n"
+    "/balance — баланс и лимиты\n"
+    "/pay — оплата (₽ UnitPay или Stars)\n"
     "/help — эта подсказка\n\n"
-    "Точечные правки с сохранением файла сейчас только для .docx."
+    "Точечные правки с сохранением файла сейчас только для .docx (Pro)."
 )
 
 
@@ -194,8 +200,33 @@ async def _require_files(message: Message, session: UserSession) -> bool:
     return False
 
 
+async def _require_quota(message: Message, action: Action) -> ConsumeResult | None:
+    user = message.from_user
+    if user is None:
+        return None
+    lang = user.language_code
+    ensure_user(user.id, lang)
+    result = consume(user.id, action, lang)
+    if result.ok:
+        return result
+    await message.answer(
+        result.message or "Лимит исчерпан. /pay",
+        reply_markup=upsell_keyboard(user.id, lang),
+    )
+    return None
+
+
+def _refund(message: Message, charge: ConsumeResult | None, action: Action) -> None:
+    user = message.from_user
+    if user is None or charge is None:
+        return
+    refund_consume(user.id, charge, action)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    if message.from_user:
+        ensure_user(message.from_user.id, message.from_user.language_code)
     await message.answer("Бот готов.\n\n" + HELP_TEXT)
 
 
@@ -212,7 +243,10 @@ async def cmd_card(message: Message, command: CommandObject) -> None:
     session.card_mode = True
     notes = (command.args or "").strip()
     if notes:
-        await _make_card(message, session, notes, None)
+        charge = await _require_quota(message, "card")
+        if charge is None:
+            return
+        await _make_card(message, session, notes, None, charge)
         return
     await message.answer(
         "Пришлите фото товара. В подписи можно указать название, материал, "
@@ -271,15 +305,20 @@ async def cmd_summary(message: Message) -> None:
         return
     if not await _require_files(message, session):
         return
+    charge = await _require_quota(message, "summary")
+    if charge is None:
+        return
     status = await message.answer("Готовлю краткое содержание…")
     try:
         async with session.lock:
             chunks = session.index.preview_chunks()
         if not chunks:
+            _refund(message, charge, "summary")
             await status.edit_text("В активных файлах нет текста для содержания.")
             return
         text = await asyncio.to_thread(summarize_document, chunks)
     except Exception as exc:
+        _refund(message, charge, "summary")
         await status.edit_text(_fit(f"Не удалось сделать содержание: {exc}"))
         return
     await _finish_status(status, message, text)
@@ -298,13 +337,17 @@ async def on_photo(message: Message) -> None:
     if not session.card_mode and not looks_like_card(caption):
         await message.answer("Чтобы собрать карточку товара, напишите /card и пришлите фото.")
         return
+    charge = await _require_quota(message, "card")
+    if charge is None:
+        return
     dest = session.user_dir(DATA_DIR) / "product.jpg"
     try:
         await message.bot.download(message.photo[-1], destination=dest)
     except Exception as exc:
+        _refund(message, charge, "card")
         await message.answer(_fit(f"Не удалось скачать фото: {exc}"))
         return
-    await _make_card(message, session, caption, dest)
+    await _make_card(message, session, caption, dest, charge)
 
 
 @router.message(F.document)
@@ -324,13 +367,17 @@ async def on_document(message: Message) -> None:
         if not session.card_mode and not looks_like_card(caption):
             await message.answer("Это картинка. Для карточки товара напишите /card и пришлите фото.")
             return
+        charge = await _require_quota(message, "card")
+        if charge is None:
+            return
         dest = session.user_dir(DATA_DIR) / name
         try:
             await message.bot.download(doc, destination=dest)
         except Exception as exc:
+            _refund(message, charge, "card")
             await message.answer(_fit(f"Не удалось скачать фото: {exc}"))
             return
-        await _make_card(message, session, caption, dest)
+        await _make_card(message, session, caption, dest, charge)
         return
     if suffix not in ALLOWED_SUFFIXES:
         await message.answer(
@@ -447,7 +494,10 @@ async def on_text(message: Message) -> None:
     if session is None:
         return
     if session.card_mode or looks_like_card(text):
-        await _make_card(message, session, text, None)
+        charge = await _require_quota(message, "card")
+        if charge is None:
+            return
+        await _make_card(message, session, text, None, charge)
         return
     if not await _require_files(message, session):
         return
@@ -462,12 +512,14 @@ async def _make_card(
     session: UserSession,
     notes: str,
     photo_path: Path | None,
+    charge: ConsumeResult,
 ) -> None:
     status = await message.answer("Собираю карточку товара…")
     image_bytes = None
     if photo_path and photo_path.exists():
         image_bytes = photo_path.read_bytes()
         if len(image_bytes) > MAX_FILE_BYTES:
+            _refund(message, charge, "card")
             await status.edit_text("Фото больше 20 МБ.")
             return
     try:
@@ -480,6 +532,7 @@ async def _make_card(
             n += 1
         await asyncio.to_thread(render_product_card, png, data, photo_path)
     except Exception as exc:
+        _refund(message, charge, "card")
         await status.edit_text(_fit(f"Не удалось собрать карточку: {exc}"))
         return
     session.card_mode = False
@@ -497,15 +550,20 @@ async def _make_card(
 
 
 async def _handle_question(message: Message, session: UserSession, text: str) -> None:
+    charge = await _require_quota(message, "ask")
+    if charge is None:
+        return
     status = await message.answer("Ищу в документах…")
     try:
         async with session.lock:
             hits = await asyncio.to_thread(session.index.search, text)
         if not hits:
+            _refund(message, charge, "ask")
             await status.edit_text("По этому запросу фрагментов не нашлось.")
             return
         data = await asyncio.to_thread(ask_document, text, hits)
     except Exception as exc:
+        _refund(message, charge, "ask")
         await status.edit_text(_fit(f"Ошибка модели: {exc}"))
         return
     answer = str(data.get("answer") or "").strip() or "Пустой ответ модели."
@@ -524,6 +582,9 @@ async def _handle_edit(message: Message, session: UserSession, text: str) -> Non
             "Задайте вопрос по тексту или отправьте Word."
         )
         return
+    charge = await _require_quota(message, "edit")
+    if charge is None:
+        return
     status = await message.answer("Готовлю план правок…")
     try:
         async with session.lock:
@@ -531,6 +592,7 @@ async def _handle_edit(message: Message, session: UserSession, text: str) -> Non
             if not hits:
                 hits = [Hit(chunk=c, score=1.0) for c in session.index.preview_chunks(12)]
         if not hits:
+            _refund(message, charge, "edit")
             await status.edit_text("В файле нет текста для правок.")
             return
         data = await asyncio.to_thread(
@@ -541,6 +603,7 @@ async def _handle_edit(message: Message, session: UserSession, text: str) -> Non
             True,
         )
     except Exception as exc:
+        _refund(message, charge, "edit")
         await status.edit_text(_fit(f"Ошибка модели: {exc}"))
         return
     kind = data.get("kind") or "none"
@@ -549,6 +612,7 @@ async def _handle_edit(message: Message, session: UserSession, text: str) -> Non
     ) or (
         kind == "rewrite" and not str(data.get("rewrite_text") or "").strip()
     ):
+        _refund(message, charge, "edit")
         summary = str(data.get("summary") or "Правки не получилось спланировать.")
         await status.edit_text(_fit(summary))
         return

@@ -6,6 +6,7 @@ python-docx
 transformers
 sentence-transformers
 aiogram
+aiohttp
 openai
 python-dotenv
 pypdf
