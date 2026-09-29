@@ -21,16 +21,16 @@ BTN_CLEAR = "Очистить"
 REPLY_BUTTONS = {BTN_CARD, BTN_DOCS, BTN_BALANCE, BTN_PLANS, BTN_HELP, BTN_CLEAR}
 
 BOT_COMMANDS = [
-    BotCommand(command="start", description="Главное меню"),
-    BotCommand(command="menu", description="Главное меню"),
-    BotCommand(command="card", description="Карточка товара для маркетплейса"),
-    BotCommand(command="summary", description="Краткое содержание документа"),
-    BotCommand(command="files", description="Список загруженных файлов"),
-    BotCommand(command="clear", description="Очистить файлы и сессию"),
+    # /menu остаётся как алиас в коде, в списке не дублируем /start
+    BotCommand(command="start", description="Открыть главное меню"),
+    BotCommand(command="card", description="Собрать карточку WB / Ozon"),
+    BotCommand(command="files", description="Мои загруженные файлы"),
+    BotCommand(command="summary", description="Краткое содержание файла"),
     BotCommand(command="balance", description="Баланс и лимиты"),
     BotCommand(command="plans", description="Тарифы"),
-    BotCommand(command="pay", description="Оплата"),
-    BotCommand(command="help", description="Справка"),
+    BotCommand(command="pay", description="Оплатить тариф"),
+    BotCommand(command="clear", description="Очистить чат, файлы и сессию"),
+    BotCommand(command="help", description="Как пользоваться ботом"),
 ]
 
 

@@ -71,16 +71,17 @@ def generate_product_photo(
     title = (title or "").strip()
     extra = (extra_prompt or "").strip()
 
-    # Пользовательское описание — главный якорь, чтобы модель не подменяла товар
+    # Пользовательское описание — главный якорь, чтобы модель не подменяла товар.
+    # Title/label — только для понимания ЧТО снимать, НЕ для надписей на фото.
     parts = [
         "Exact e-commerce product to photograph. Match this description precisely. "
         "Do NOT replace with a different product or category.",
         f"User request: {brief}",
     ]
     if label:
-        parts.append(f"Product type (Russian label): {label}")
+        parts.append(f"Product category hint (do NOT print this text on the photo): {label}")
     if title:
-        parts.append(f"Product title: {title}")
+        parts.append(f"Product identity hint (do NOT print this text on the photo): {title}")
     if extra and extra.lower() not in brief.lower():
         parts.append(f"Visual details: {extra}")
     parts.append(
@@ -88,8 +89,12 @@ def generate_product_photo(
         "Complete recognizable product, upright and level (not tilted, not skewed, straight vertical axis), "
         "3/4 angle, soft studio softbox, subtle ground shadow, "
         "isolated on transparent or seamless light grey background, sharp details, centered in frame. "
-        "Forbidden: wrong category, shoes, boots, sneakers, bags, unrelated objects, "
-        "tilted or rotated product, dutch angle, people, hands, text, logos, watermarks, "
+        "If the item is a book, box, pack, bottle or packaging: use a BLANK plain cover / solid color surface "
+        "with NO lettering, NO titles, NO labels, NO fake brand marks. "
+        "Forbidden: any readable text, Cyrillic, Latin letters, numbers as captions, logos, watermarks, "
+        "UI mockups, posters with slogans, book covers with titles, packaging typography, "
+        "wrong category, shoes, boots, sneakers, bags, unrelated objects, "
+        "tilted or rotated product, dutch angle, people, hands, "
         "collage, multiple items, cropped beyond recognition."
     )
     prompt = "\n".join(parts)
@@ -355,7 +360,9 @@ def make_product_card(notes: str, image_bytes: bytes | None = None) -> dict[str,
         "image_prompt — English ONLY for the photo. MUST start with the exact product "
         "from the user request (e.g. 'green velvet armchair with metal legs and brass tips'). "
         "Never invent another category (no shoes, no boots, no unrelated items). "
-        "Studio catalog shot, isolated, no text. "
+        "Studio catalog shot, isolated product. "
+        "CRITICAL: no text anywhere in the image — no titles, captions, logos, packaging lettering, "
+        "Cyrillic or Latin on the product; blank covers for books/boxes. "
         "origin — например «Сделано в России» или пусто. "
         "accent — hex мягкого цвета под товар, например #E8A598."
     )
@@ -406,6 +413,45 @@ def make_product_card(notes: str, image_bytes: bytes | None = None) -> dict[str,
         accent = "#" + accent
     hook = str(data.get("hook") or data.get("subtitle") or "").strip()
     size = str(data.get("size") or "").strip().upper()
+    # Не выдумываем габарит, если в запросе пользователя нет цифр
+    if size and not re.search(r"\d", notes or ""):
+        size = ""
+    origin = str(data.get("origin") or "").strip()[:40]
+    # Origin только если намек есть в тексте пользователя
+    if origin and notes:
+        notes_l = notes.lower()
+        origin_ok = any(
+            w in notes_l
+            for w in (
+                "росси",
+                "беларус",
+                "белорус",
+                "китай",
+                "турц",
+                "сделано",
+                "произвед",
+                "страна",
+            )
+        )
+        if not origin_ok:
+            origin = ""
+    # image_prompt не должен просить надписи на товаре
+    for bad in (
+        "with text",
+        "title on",
+        "lettering",
+        "cyrillic",
+        "write ",
+        "inscription",
+        "надпис",
+        "текст на",
+    ):
+        if bad in image_prompt.lower():
+            image_prompt = re.sub(re.escape(bad), " ", image_prompt, flags=re.I)
+    image_prompt = (
+        image_prompt.strip()
+        + ". No text, letters, logos or titles on the product surface; blank packaging if any."
+    )
     return {
         "label": str(data.get("label") or "").strip()[:16],
         "title": title,
@@ -417,6 +463,6 @@ def make_product_card(notes: str, image_bytes: bytes | None = None) -> dict[str,
         "description": str(data.get("description") or "").strip(),
         "keywords": str(data.get("keywords") or "").strip(),
         "image_prompt": image_prompt[:400],
-        "origin": str(data.get("origin") or "").strip()[:40],
+        "origin": origin,
         "accent": accent[:7],
     }
