@@ -58,10 +58,10 @@ ACTION_COST: dict[Action, int] = {
 
 # Free daily caps (edit blocked on free)
 FREE_DAILY: dict[Action, int] = {
-    "ask": 5,
-    "summary": 1,
+    "ask": 100,
+    "summary": 100,
     "edit": 0,
-    "card": 1,
+    "card": 100,
 }
 
 

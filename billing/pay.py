@@ -12,33 +12,33 @@ from config import STARS_SUBSCRIPTION_PERIOD
 def plans_text(lang_ru: bool = True) -> str:
     if lang_ru:
         lines = [
-            "Тарифы:",
+            "<b>Тарифы</b>",
             "",
-            "Free — несколько запросов в день, без правок Word.",
-            "Pro (30 дней) — пул кредитов + правки .docx.",
-            "Пакеты кредитов — докупка (тратятся и без Pro, кроме правок Word).",
+            "<b>Free</b> — до 100 запросов / summary / карточек в день, без правок Word",
+            "<b>Pro</b> (30 дней) — пул кредитов + правки .docx",
+            "<b>Пакеты кредитов</b> — докупка (кроме правок Word)",
             "",
         ]
         for sku in SKUS.values():
             lines.append(
-                f"• {sku.title_ru}: {sku.price_rub:.0f} ₽ / {sku.price_stars} Stars"
-                + (f", +{sku.credits} кредитов" if sku.credits else "")
+                f"• <b>{sku.title_ru}</b> — {sku.price_rub:.0f} ₽ / {sku.price_stars} Stars"
+                + (f", +{sku.credits} кр." if sku.credits else "")
             )
         lines.append("")
-        lines.append("Оплата: /pay")
+        lines.append("Оплата: /pay или кнопка «Тарифы»")
         return "\n".join(lines)
     lines = [
-        "Plans:",
+        "<b>Plans</b>",
         "",
-        "Free — a few requests per day, no Word edits.",
-        "Pro (30 days) — credit pool + .docx edits.",
-        "Credit packs — top-ups (spendable without Pro, except Word edits).",
+        "<b>Free</b> — up to 100 asks / summaries / cards per day, no Word edits",
+        "<b>Pro</b> (30 days) — credit pool + .docx edits",
+        "<b>Credit packs</b> — top-ups (except Word edits)",
         "",
     ]
     for sku in SKUS.values():
         lines.append(
-            f"• {sku.title_en}: {sku.price_stars} Stars / {sku.price_rub:.0f} RUB"
-            + (f", +{sku.credits} credits" if sku.credits else "")
+            f"• <b>{sku.title_en}</b> — {sku.price_stars} Stars / {sku.price_rub:.0f} RUB"
+            + (f", +{sku.credits} cr." if sku.credits else "")
         )
     lines.append("")
     lines.append("Pay: /pay")
@@ -50,30 +50,38 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
     lang_ru = (language_code or "").lower().startswith("ru") or info.rail == "unitpay"
     if lang_ru:
         lines = [
-            f"Тариф: {'Pro' if info.is_pro else 'Free'}",
-            f"Кредиты: {info.credits}",
-            f"Рельс оплаты: {'₽ UnitPay' if info.rail == 'unitpay' else 'Stars'}",
+            "<b>Баланс</b>",
+            "",
+            f"Тариф: <b>{'Pro' if info.is_pro else 'Free'}</b>",
+            f"Кредиты: <b>{info.credits}</b>",
+            f"Оплата: {'₽ UnitPay' if info.rail == 'unitpay' else 'Stars'}",
         ]
         if info.is_pro and info.expires_at:
             lines.append(f"Pro до: {info.expires_at}")
         if not info.is_pro:
+            lines.append("")
+            lines.append("<b>Сегодня (Free)</b>")
             lines.append(
-                f"Сегодня Free: вопросы {info.daily_ask}/{info.daily_ask_limit}, "
-                f"summary {info.daily_summary}/{info.daily_summary_limit}, "
+                f"Вопросы {info.daily_ask}/{info.daily_ask_limit} · "
+                f"summary {info.daily_summary}/{info.daily_summary_limit} · "
                 f"карточки {info.daily_card}/{info.daily_card_limit}"
             )
         return "\n".join(lines)
     lines = [
-        f"Plan: {'Pro' if info.is_pro else 'Free'}",
-        f"Credits: {info.credits}",
-        f"Payment rail: {'Stars' if info.rail == 'stars' else 'UnitPay RUB'}",
+        "<b>Balance</b>",
+        "",
+        f"Plan: <b>{'Pro' if info.is_pro else 'Free'}</b>",
+        f"Credits: <b>{info.credits}</b>",
+        f"Payment: {'Stars' if info.rail == 'stars' else 'UnitPay RUB'}",
     ]
     if info.is_pro and info.expires_at:
         lines.append(f"Pro until: {info.expires_at}")
     if not info.is_pro:
+        lines.append("")
+        lines.append("<b>Today (Free)</b>")
         lines.append(
-            f"Today Free: asks {info.daily_ask}/{info.daily_ask_limit}, "
-            f"summary {info.daily_summary}/{info.daily_summary_limit}, "
+            f"Asks {info.daily_ask}/{info.daily_ask_limit} · "
+            f"summary {info.daily_summary}/{info.daily_summary_limit} · "
             f"cards {info.daily_card}/{info.daily_card_limit}"
         )
     return "\n".join(lines)

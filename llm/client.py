@@ -2,29 +2,138 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 from typing import Any
 
 from openai import OpenAI
 
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+from config import (
+    IMAGE_MODEL,
+    IMAGE_TIMEOUT,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MODEL,
+    LLM_TIMEOUT,
+)
 from rag.pipeline import Chunk, Hit
 
+log = logging.getLogger(__name__)
+
 _client: OpenAI | None = None
+_image_client: OpenAI | None = None
 
 
 def get_client() -> OpenAI:
     global _client
     if not LLM_API_KEY:
         raise RuntimeError(
-            "Не задан LLM_API_KEY. Откройте .env и вставьте ключ OpenAI API."
+            "Не задан LLM_API_KEY. Откройте .env и вставьте ключ AITunnel (sk-aitunnel-...)."
         )
     if _client is None:
-        kwargs: dict[str, Any] = {"api_key": LLM_API_KEY}
+        kwargs: dict[str, Any] = {
+            "api_key": LLM_API_KEY,
+            "timeout": LLM_TIMEOUT,
+        }
         if LLM_BASE_URL:
             kwargs["base_url"] = LLM_BASE_URL
         _client = OpenAI(**kwargs)
     return _client
+
+
+def get_image_client() -> OpenAI:
+    global _image_client
+    if not LLM_API_KEY:
+        raise RuntimeError(
+            "Не задан LLM_API_KEY. Откройте .env и вставьте ключ AITunnel (sk-aitunnel-...)."
+        )
+    if _image_client is None:
+        kwargs: dict[str, Any] = {
+            "api_key": LLM_API_KEY,
+            "timeout": IMAGE_TIMEOUT,
+        }
+        if LLM_BASE_URL:
+            kwargs["base_url"] = LLM_BASE_URL
+        _image_client = OpenAI(**kwargs)
+    return _image_client
+
+
+def generate_product_photo(
+    product_brief: str,
+    title: str = "",
+    label: str = "",
+    extra_prompt: str = "",
+) -> bytes:
+    """Студийное фото товара для карточки маркетплейса (AITunnel images/generations)."""
+    client = get_image_client()
+    brief = (product_brief or title or "product").strip()
+    label = (label or "").strip()
+    title = (title or "").strip()
+    extra = (extra_prompt or "").strip()
+
+    # Пользовательское описание — главный якорь, чтобы модель не подменяла товар
+    parts = [
+        "Exact e-commerce product to photograph. Match this description precisely. "
+        "Do NOT replace with a different product or category.",
+        f"User request: {brief}",
+    ]
+    if label:
+        parts.append(f"Product type (Russian label): {label}")
+    if title:
+        parts.append(f"Product title: {title}")
+    if extra and extra.lower() not in brief.lower():
+        parts.append(f"Visual details: {extra}")
+    parts.append(
+        "Photorealistic marketplace catalog photo of THIS exact item only. "
+        "Complete recognizable product, upright and level (not tilted, not skewed, straight vertical axis), "
+        "3/4 angle, soft studio softbox, subtle ground shadow, "
+        "isolated on transparent or seamless light grey background, sharp details, centered in frame. "
+        "Forbidden: wrong category, shoes, boots, sneakers, bags, unrelated objects, "
+        "tilted or rotated product, dutch angle, people, hands, text, logos, watermarks, "
+        "collage, multiple items, cropped beyond recognition."
+    )
+    prompt = "\n".join(parts)
+
+    attempts: list[dict[str, Any]] = [
+        {
+            "model": IMAGE_MODEL,
+            "prompt": prompt,
+            "n": 1,
+            "size": "1024x1024",
+            "quality": "medium",
+            "response_format": "b64_json",
+            "background": "transparent",
+            "output_format": "png",
+        },
+        {
+            "model": IMAGE_MODEL,
+            "prompt": prompt,
+            "n": 1,
+            "size": "1024x1024",
+            "quality": "medium",
+            "response_format": "b64_json",
+        },
+    ]
+    last_error: Exception | None = None
+    for i, kwargs in enumerate(attempts, start=1):
+        try:
+            log.info(
+                "Image gen attempt %s model=%s brief=%r",
+                i,
+                kwargs.get("model"),
+                brief[:80],
+            )
+            resp = client.images.generate(**kwargs)
+            if resp.data and getattr(resp.data[0], "b64_json", None):
+                return base64.b64decode(resp.data[0].b64_json)
+            last_error = RuntimeError("Модель не вернула b64_json")
+            log.warning("Image gen attempt %s: empty b64_json", i)
+        except Exception as exc:
+            last_error = exc
+            log.warning("Image gen attempt %s failed: %s", i, exc)
+    raise RuntimeError(
+        f"Не удалось сгенерировать фото товара: {last_error}"
+    ) from last_error
 
 
 def _format_hits(hits: list[Hit]) -> str:
@@ -187,6 +296,8 @@ def looks_like_card(text: str) -> bool:
     lowered = (text or "").lower()
     if "инфографик" in lowered:
         return True
+    if any(k in lowered for k in ("продаю", "продажа", "для продажи", "listing")):
+        return True
     market = any(
         k in lowered
         for k in ("wildberries", "вайлдберр", "маркетплейс")
@@ -220,41 +331,92 @@ def _as_jpeg(image_bytes: bytes) -> bytes:
 
 def make_product_card(notes: str, image_bytes: bytes | None = None) -> dict[str, Any]:
     system = (
-        "Ты копирайтер карточек товара для Wildberries и Ozon. "
-        "Пиши по-русски, без воды и клише вроде «премиум качество». "
-        "Не выдумывай факты, которых нет в тексте или на фото: материал, бренд, размеры — только если видно или сказано. "
+        "Ты арт-директор карточек Wildberries/Ozon. Делаешь серию из 3 слайдов: "
+        "обложка (CTR), детали с выносками, преимущества. "
+        "Пиши по-русски коротко и ясно, без клише («премиум», «высокое качество»). "
+        "Не выдумывай факты — только из текста/фото. "
         "Верни JSON: "
-        '{"title": str, "subtitle": str, "bullets": [str], "description": str, "keywords": str}. '
-        "title — до 60 символов, цепляющий. subtitle — одно короткое уточнение. "
-        "bullets — 4-5 выгод, каждая до 70 символов. "
-        "description — 400-700 символов, связный текст для описания. "
-        "keywords — строка через запятую, 8-15 запросов для поиска."
+        '{"label": str, "title": str, "subtitle": str, "hook": str, "size": str, '
+        '"callouts": [str], "bullets": [str], "description": str, "keywords": str, '
+        '"image_prompt": str, "origin": str, "accent": str}. '
+        "label — тип товара ЗАГЛАВНЫМИ (СТУЛ, КРЕСЛО, МЕДВЕЖОНОК), до 14 символов. "
+        "title — полное название до 55 символов, 4–8 слов; всегда дописывай фразу целиком "
+        "(например «Деревянный обеденный стол на 6 персон»), без многоточия и обрезки. "
+        "Не заканчивай предлогом (для/на/с/и). "
+        "subtitle — короткое имя/модель для второй строки обложки, до 24 символов "
+        "(например «ЧИБА»), или пусто. "
+        "hook — одна короткая выгода для бейджа, до 28 символов, в одну строку. "
+        "size — габарит для бейджа на обложке: «28 CM», «180×90», «Ø40» или пусто если неизвестно. "
+        "callouts — ровно 3 выноски (материал/деталь/конструкция), до 22 символов, "
+        "короткие (1–4 слова), полный смысл без обрезки. "
+        "bullets — ровно 4 преимущества, до 40 символов, полные фразы без «…». "
+        "description — 350-550 символов для описания на маркетплейсе. "
+        "keywords — 8-12 фраз через запятую. "
+        "image_prompt — English ONLY for the photo. MUST start with the exact product "
+        "from the user request (e.g. 'green velvet armchair with metal legs and brass tips'). "
+        "Never invent another category (no shoes, no boots, no unrelated items). "
+        "Studio catalog shot, isolated, no text. "
+        "origin — например «Сделано в России» или пусто. "
+        "accent — hex мягкого цвета под товар, например #E8A598."
     )
     notes = (notes or "").strip()
     user = notes if notes else "Собери карточку по фото товара."
     jpeg = None
     if image_bytes:
-        user += "\nНа фото товар. Опиши его честно и собери карточку."
+        user += "\nНа фото товар. Опиши честно и собери серию слайдов под маркетплейс."
         jpeg = _as_jpeg(image_bytes)
-    raw = _chat(system, user, image_bytes=jpeg, temperature=0.4)
+    raw = _chat(system, user, image_bytes=jpeg, temperature=0.45)
     try:
         data = _extract_json(raw)
     except Exception:
         data = {
+            "label": "",
             "title": "Карточка товара",
             "subtitle": "",
+            "hook": "",
+            "size": "",
+            "callouts": [],
             "bullets": [],
             "description": raw,
             "keywords": "",
+            "image_prompt": notes,
+            "origin": "",
+            "accent": "",
         }
+
+    def _clip(s: str, n: int) -> str:
+        s = (s or "").strip()
+        if len(s) <= n:
+            return s
+        cut = s[:n].rsplit(" ", 1)[0].rstrip(" .,;:—-")
+        return cut or s[:n]
+
     bullets = data.get("bullets") or []
     if not isinstance(bullets, list):
         bullets = [str(bullets)]
-    bullets = [str(x).strip() for x in bullets if str(x).strip()]
+    bullets = [_clip(str(x), 40) for x in bullets if str(x).strip()]
+    callouts = data.get("callouts") or []
+    if not isinstance(callouts, list):
+        callouts = [str(callouts)]
+    callouts = [_clip(str(x), 22) for x in callouts if str(x).strip()]
+    title = _clip(str(data.get("title") or "Карточка товара"), 55)
+    image_prompt = str(data.get("image_prompt") or notes or title).strip()
+    accent = str(data.get("accent") or "").strip()
+    if accent and not accent.startswith("#"):
+        accent = "#" + accent
+    hook = str(data.get("hook") or data.get("subtitle") or "").strip()
+    size = str(data.get("size") or "").strip().upper()
     return {
-        "title": str(data.get("title") or "Карточка товара").strip()[:80],
-        "subtitle": str(data.get("subtitle") or "").strip()[:120],
-        "bullets": bullets[:6],
+        "label": str(data.get("label") or "").strip()[:16],
+        "title": title,
+        "subtitle": _clip(str(data.get("subtitle") or ""), 24),
+        "hook": _clip(hook, 28),
+        "size": _clip(size, 16),
+        "callouts": callouts[:3],
+        "bullets": bullets[:4],
         "description": str(data.get("description") or "").strip(),
         "keywords": str(data.get("keywords") or "").strip(),
+        "image_prompt": image_prompt[:400],
+        "origin": str(data.get("origin") or "").strip()[:40],
+        "accent": accent[:7],
     }

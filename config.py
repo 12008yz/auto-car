@@ -11,8 +11,13 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").strip()
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.aitunnel.ru/v1").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
+# Генерация фото товара для карточек (AITunnel /images/generations)
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1-mini").strip()
+# Таймауты HTTP к AITunnel (секунды)
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "90"))
+IMAGE_TIMEOUT = float(os.getenv("IMAGE_TIMEOUT", "120"))
 
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",

@@ -10,7 +10,7 @@ if not exist ".venv\Scripts\python.exe" (
 if not exist ".env" (
   copy ".env.example" ".env" >nul
   echo Created .env from .env.example
-  echo Fill TELEGRAM_BOT_TOKEN and LLM_API_KEY, then run this file again.
+  echo Fill TELEGRAM_BOT_TOKEN and LLM_API_KEY ^(AITunnel^), then run this file again.
   pause
   exit /b 1
 )

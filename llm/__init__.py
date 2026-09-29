@@ -1,5 +1,6 @@
 from llm.client import (
     ask_document,
+    generate_product_photo,
     looks_like_card,
     looks_like_edit,
     make_product_card,
@@ -9,6 +10,7 @@ from llm.client import (
 
 __all__ = [
     "ask_document",
+    "generate_product_photo",
     "looks_like_card",
     "looks_like_edit",
     "make_product_card",

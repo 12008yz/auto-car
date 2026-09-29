@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher
 from billing.db import init_db
 from billing.handlers import router as billing_router
 from billing.webhook import start_billing_server
+from bot import ui
 from bot.handlers import router
 from config import (
     BILLING_HTTP_HOST,
@@ -40,7 +41,7 @@ def require_secrets() -> None:
         f"Не заданы ключи: {names}.\n"
         "Откройте файл .env в папке проекта и вставьте:\n"
         "  TELEGRAM_BOT_TOKEN — токен от @BotFather\n"
-        "  LLM_API_KEY — ключ OpenAI API (не подписка ChatGPT Plus)\n"
+        "  LLM_API_KEY — ключ AITunnel (sk-aitunnel-... из кабинета)\n"
         "Затем снова запустите run_bot.cmd"
     )
 
@@ -70,6 +71,7 @@ async def _run() -> None:
     log.info("Загружаю модель поиска по документам…")
     get_embedder()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    await bot.set_my_commands(ui.BOT_COMMANDS)
     dp = Dispatcher()
     dp.include_router(billing_router)
     dp.include_router(router)
@@ -79,6 +81,7 @@ async def _run() -> None:
     finally:
         if runner is not None:
             await runner.cleanup()
+        await bot.session.close()
 
 
 def main() -> None:

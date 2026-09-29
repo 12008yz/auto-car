@@ -2,29 +2,37 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Iterable
+from html import escape
 from pathlib import Path
+from typing import Any, Awaitable, Callable
 
-from aiogram import F, Router
+from aiogram import BaseMiddleware, F, Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
+    TelegramObject,
     User,
 )
 
 from billing.pay import upsell_keyboard
 from billing.service import ConsumeResult, consume, ensure_user, refund_consume
 from billing.skus import Action
-from bot.session import PendingEdit, UserSession, get_session
-from card.render import render_product_card
+from bot.session import PendingEdit, UserSession, clear_user_workspace, get_session
+from bot import ui
+from card.render import render_product_card_pack
 from config import ALLOWED_SUFFIXES, DATA_DIR, IMAGE_SUFFIXES, MAX_FILE_BYTES, TELEGRAM_MAX_LEN
 from docs.loaders import load_document
 from edit.docx_patch import apply_patches, write_rewrite_docx
 from llm.client import (
     ask_document,
+    generate_product_photo,
     looks_like_card,
     looks_like_edit,
     make_product_card,
@@ -35,20 +43,94 @@ from rag.pipeline import Hit, chunk_blocks
 
 router = Router()
 
-HELP_TEXT = (
-    "Документы: отправьте Word, PDF, Excel, PowerPoint, TXT, MD, CSV — "
-    "потом вопрос по тексту или правку Word.\n\n"
-    "Карточка товара: /card и фото (можно с подписью: название, материал, для кого).\n\n"
-    "/card — режим карточки товара\n"
-    "/summary — краткое содержание активного файла\n"
-    "/files — список загруженных файлов\n"
-    "/use имя_файла — сделать файл активным\n"
-    "/plans — тарифы\n"
-    "/balance — баланс и лимиты\n"
-    "/pay — оплата (₽ UnitPay или Stars)\n"
-    "/help — эта подсказка\n\n"
-    "Точечные правки с сохранением файла сейчас только для .docx (Pro)."
-)
+
+class _TrackChatMessagesMiddleware(BaseMiddleware):
+    """Запоминает message_id входящих сообщений для последующей очистки ленты."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if isinstance(event, Message) and event.from_user is not None:
+            get_session(event.from_user.id).remember_chat_message(event.message_id)
+        elif isinstance(event, CallbackQuery) and event.from_user is not None and event.message:
+            get_session(event.from_user.id).remember_chat_message(event.message.message_id)
+        return await handler(event, data)
+
+
+router.message.middleware(_TrackChatMessagesMiddleware())
+router.callback_query.middleware(_TrackChatMessagesMiddleware())
+
+
+async def _delete_chat_messages(
+    bot,
+    chat_id: int,
+    *,
+    known_ids: Iterable[int] = (),
+    up_to_id: int | None = None,
+    depth: int = 10_000,
+) -> int:
+    """
+    Чистит переписку в личке: message_id от 1 до текущего.
+    Telegram не удаляет сообщения старше ~48 часов — такие id просто пропускаются.
+    """
+    known = [int(x) for x in known_ids if int(x) > 0]
+    end = int(up_to_id or 0)
+    if known:
+        end = max(end, max(known))
+    if end <= 0:
+        return 0
+
+    start = 1
+    if depth > 0 and end - start + 1 > depth:
+        start = end - depth + 1
+
+    ids = list(range(start, end + 1))
+    deleted = 0
+
+    async def _delete_batch(batch: list[int]) -> int:
+        try:
+            await bot.delete_messages(chat_id=chat_id, message_ids=batch)
+            return len(batch)
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+            try:
+                await bot.delete_messages(chat_id=chat_id, message_ids=batch)
+                return len(batch)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        ok = 0
+        for mid in batch:
+            try:
+                await bot.delete_message(chat_id, mid)
+                ok += 1
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 0.5)
+                try:
+                    await bot.delete_message(chat_id, mid)
+                    ok += 1
+                except Exception:
+                    continue
+            except Exception:
+                continue
+        return ok
+
+    for i in range(0, len(ids), 100):
+        deleted += await _delete_batch(ids[i : i + 100])
+        if i and i % 500 == 0:
+            await asyncio.sleep(0.2)
+    return deleted
+
+
+def _remember_bot_message(user_id: int | None, message: Message | None) -> None:
+    if user_id is None or message is None:
+        return
+    get_session(user_id).remember_chat_message(message.message_id)
 
 
 def _user_id(user: User | None) -> int | None:
@@ -196,7 +278,10 @@ def _ingest_path(session: UserSession, path: Path) -> int:
 async def _require_files(message: Message, session: UserSession) -> bool:
     if session.index.files:
         return True
-    await message.answer("Сначала отправьте документ.")
+    await message.answer(
+        "Сначала пришлите документ — или откройте раздел «Документы».",
+        reply_markup=ui.docs_inline(),
+    )
     return False
 
 
@@ -227,12 +312,42 @@ def _refund(message: Message, charge: ConsumeResult | None, action: Action) -> N
 async def cmd_start(message: Message) -> None:
     if message.from_user:
         ensure_user(message.from_user.id, message.from_user.language_code)
-    await message.answer("Бот готов.\n\n" + HELP_TEXT)
+    name = message.from_user.first_name if message.from_user else None
+    await message.answer(
+        ui.welcome_text(name),
+        parse_mode="HTML",
+        reply_markup=ui.main_reply_keyboard(),
+    )
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    await message.answer(
+        ui.help_text(),
+        parse_mode="HTML",
+        reply_markup=ui.back_home_inline(),
+    )
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    await message.answer(
+        ui.welcome_text(
+            message.from_user.first_name if message.from_user else None
+        ),
+        parse_mode="HTML",
+        reply_markup=ui.main_reply_keyboard(),
+    )
+
+
+@router.message(Command("clear"))
+async def cmd_clear(message: Message) -> None:
+    sent = await message.answer(
+        ui.clear_prompt_text(),
+        parse_mode="HTML",
+        reply_markup=ui.clear_confirm_inline(),
+    )
+    _remember_bot_message(_user_id(message.from_user), sent)
 
 
 @router.message(Command("card"))
@@ -249,10 +364,191 @@ async def cmd_card(message: Message, command: CommandObject) -> None:
         await _make_card(message, session, notes, None, charge)
         return
     await message.answer(
-        "Пришлите фото товара. В подписи можно указать название, материал, "
-        "для кого, размеры и плюсы.\n"
-        "Можно и без фото — просто напишите, что продаёте."
+        ui.card_prompt_text(),
+        parse_mode="HTML",
+        reply_markup=ui.card_inline(),
     )
+
+
+@router.message(F.text.in_(ui.REPLY_BUTTONS))
+async def on_menu_button(message: Message) -> None:
+    text = (message.text or "").strip()
+    session = _session_of(message.from_user)
+    if session is None:
+        return
+    if text == ui.BTN_HELP:
+        await cmd_help(message)
+        return
+    if text == ui.BTN_CLEAR:
+        await cmd_clear(message)
+        return
+    if text == ui.BTN_CARD:
+        session.card_mode = True
+        await message.answer(
+            ui.card_prompt_text(),
+            parse_mode="HTML",
+            reply_markup=ui.card_inline(),
+        )
+        return
+    if text == ui.BTN_DOCS:
+        await message.answer(
+            ui.docs_prompt_text(),
+            parse_mode="HTML",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+    if text == ui.BTN_BALANCE:
+        from billing.handlers import cmd_balance
+
+        await cmd_balance(message)
+        return
+    if text == ui.BTN_PLANS:
+        from billing.handlers import cmd_plans
+
+        await cmd_plans(message)
+        return
+
+
+@router.callback_query(F.data.startswith("menu:"))
+async def on_menu_callback(query: CallbackQuery) -> None:
+    if query.from_user is None or not query.data or query.message is None:
+        await query.answer()
+        return
+    action = query.data.split(":", 1)[1]
+    session = get_session(query.from_user.id)
+    await query.answer()
+
+    if action == "home":
+        await query.message.answer(
+            ui.welcome_text(query.from_user.first_name),
+            parse_mode="HTML",
+            reply_markup=ui.main_reply_keyboard(),
+        )
+        return
+    if action == "clear_no":
+        try:
+            await query.message.edit_text("Очистка отменена.")
+        except Exception:
+            await query.message.answer("Очистка отменена.")
+        return
+    if action == "clear_yes":
+        chat_id = query.message.chat.id
+        up_to = query.message.message_id
+        known = list(session.chat_message_ids)
+        known.append(up_to)
+        try:
+            await query.message.edit_text("Очищаю переписку…")
+        except Exception:
+            pass
+        clear_user_workspace(query.from_user.id, DATA_DIR)
+        await _delete_chat_messages(
+            query.bot,
+            chat_id,
+            known_ids=known,
+            up_to_id=up_to,
+            depth=10_000,
+        )
+        sent = await query.bot.send_message(
+            chat_id,
+            ui.welcome_text(query.from_user.first_name),
+            parse_mode="HTML",
+            reply_markup=ui.main_reply_keyboard(),
+        )
+        _remember_bot_message(query.from_user.id, sent)
+        return
+    if action == "help":
+        await query.message.answer(
+            ui.help_text(),
+            parse_mode="HTML",
+            reply_markup=ui.back_home_inline(),
+        )
+        return
+    if action == "card":
+        session.card_mode = True
+        await query.message.answer(
+            ui.card_prompt_text(),
+            parse_mode="HTML",
+            reply_markup=ui.card_inline(),
+        )
+        return
+    if action == "card_example":
+        session.card_mode = True
+        await query.message.answer(
+            ui.card_example_text(),
+            parse_mode="HTML",
+            reply_markup=ui.card_inline(),
+        )
+        return
+    if action == "docs":
+        await query.message.answer(
+            ui.docs_prompt_text(),
+            parse_mode="HTML",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+    if action == "files":
+        await _send_files_list(query.message, session)
+        return
+    if action == "summary":
+        if not session.index.files:
+            await query.message.answer(
+                "Сначала пришлите документ.",
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        status = await query.message.answer("Готовлю краткое содержание…")
+        charge = consume(query.from_user.id, "summary", query.from_user.language_code)
+        if not charge.ok:
+            await status.edit_text(charge.message or "Лимит исчерпан. /pay")
+            await query.message.answer(
+                "Открыть тарифы: /pay",
+                reply_markup=upsell_keyboard(
+                    query.from_user.id, query.from_user.language_code
+                ),
+            )
+            return
+        try:
+            async with session.lock:
+                chunks = session.index.preview_chunks()
+            if not chunks:
+                refund_consume(query.from_user.id, charge, "summary")
+                await status.edit_text("В активных файлах нет текста.")
+                return
+            text = await asyncio.to_thread(summarize_document, chunks)
+        except Exception as exc:
+            refund_consume(query.from_user.id, charge, "summary")
+            await status.edit_text(_fit(f"Не удалось: {exc}"))
+            return
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await _reply_long(query.message, text)
+        return
+    if action == "balance":
+        from billing.pay import balance_text
+
+        ensure_user(query.from_user.id, query.from_user.language_code)
+        await query.message.answer(
+            balance_text(query.from_user.id, query.from_user.language_code),
+            parse_mode="HTML",
+            reply_markup=ui.back_home_inline(),
+        )
+        return
+    if action == "plans":
+        from billing.pay import pay_keyboard, plans_text
+        from billing.service import get_rail
+
+        lang = query.from_user.language_code
+        ensure_user(query.from_user.id, lang)
+        rail = get_rail(query.from_user.id, lang)
+        ru = (lang or "").lower().startswith("ru") or rail == "unitpay"
+        await query.message.answer(
+            plans_text(ru),
+            parse_mode="HTML",
+            reply_markup=pay_keyboard(rail, ru),
+        )
+        return
 
 
 @router.message(Command("files"))
@@ -260,14 +556,25 @@ async def cmd_files(message: Message) -> None:
     session = _session_of(message.from_user)
     if session is None:
         return
+    await _send_files_list(message, session)
+
+
+async def _send_files_list(message: Message, session: UserSession) -> None:
     if not session.index.files:
-        await message.answer("Файлов пока нет. Отправьте документ.")
+        await message.answer(
+            "Файлов пока нет.\nПришлите документ в чат.",
+            reply_markup=ui.docs_inline(),
+        )
         return
     lines = []
     for item in session.index.files:
-        mark = " (активный)" if session.active_path and item.path == session.active_path else ""
-        lines.append(f"• {item.name}{mark}")
-    await _reply_long(message, "Загружено:\n" + "\n".join(lines))
+        mark = " ✓" if session.active_path and item.path == session.active_path else ""
+        lines.append(f"• {escape(item.name)}{mark}")
+    await message.answer(
+        "<b>Ваши файлы</b>\n" + "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=ui.docs_inline(),
+    )
 
 
 @router.message(Command("use"))
@@ -335,7 +642,10 @@ async def on_photo(message: Message) -> None:
         session.card_mode = True
         caption = (card_cmd.group(1) or "").strip()
     if not session.card_mode and not looks_like_card(caption):
-        await message.answer("Чтобы собрать карточку товара, напишите /card и пришлите фото.")
+        await message.answer(
+            "Чтобы собрать карточку, нажмите «Карточка» или /card — "
+            "затем описание либо фото товара."
+        )
         return
     charge = await _require_quota(message, "card")
     if charge is None:
@@ -365,7 +675,10 @@ async def on_document(message: Message) -> None:
             session.card_mode = True
             caption = (card_cmd.group(1) or "").strip()
         if not session.card_mode and not looks_like_card(caption):
-            await message.answer("Это картинка. Для карточки товара напишите /card и пришлите фото.")
+            await message.answer(
+                "Это картинка. Для карточки нажмите «Карточка» "
+                "и пришлите фото товара или описание."
+            )
             return
         charge = await _require_quota(message, "card")
         if charge is None:
@@ -405,8 +718,10 @@ async def on_document(message: Message) -> None:
         )
         return
     await status.edit_text(
-        f"Готово: {name}. Фрагментов: {n_chunks}. "
-        "Можно спрашивать по тексту или просить правки (для .docx)."
+        f"✅ <b>{escape(name)}</b> загружен\n"
+        f"Фрагментов: {n_chunks}\n\n"
+        "Задайте вопрос по тексту или попросите правку (.docx — Pro).",
+        parse_mode="HTML",
     )
     caption = (message.caption or "").strip()
     if caption and not caption.startswith("/"):
@@ -514,7 +829,7 @@ async def _make_card(
     photo_path: Path | None,
     charge: ConsumeResult,
 ) -> None:
-    status = await message.answer("Собираю карточку товара…")
+    status = await message.answer(ui.status_card_copy())
     image_bytes = None
     if photo_path and photo_path.exists():
         image_bytes = photo_path.read_bytes()
@@ -522,15 +837,30 @@ async def _make_card(
             _refund(message, charge, "card")
             await status.edit_text("Фото больше 20 МБ.")
             return
+    paths: list[Path] = []
     try:
         data = await asyncio.to_thread(make_product_card, notes or "", image_bytes)
         dest_dir = session.user_dir(DATA_DIR)
-        png = dest_dir / "card.png"
+        if photo_path is None or not photo_path.exists():
+            await status.edit_text(ui.status_card_photo())
+            gen_bytes = await asyncio.to_thread(
+                generate_product_photo,
+                notes or str(data.get("title") or "product"),
+                str(data.get("title") or ""),
+                str(data.get("label") or ""),
+                str(data.get("image_prompt") or ""),
+            )
+            photo_path = dest_dir / "product_gen.png"
+            photo_path.write_bytes(gen_bytes)
+        await status.edit_text(ui.status_card_layout())
+        stem = "card"
         n = 1
-        while png.exists():
-            png = dest_dir / f"card_{n}.png"
+        while (dest_dir / f"{stem}_hero.png").exists():
+            stem = f"card_{n}"
             n += 1
-        await asyncio.to_thread(render_product_card, png, data, photo_path)
+        paths = await asyncio.to_thread(
+            render_product_card_pack, dest_dir, data, photo_path, stem
+        )
     except Exception as exc:
         _refund(message, charge, "card")
         await status.edit_text(_fit(f"Не удалось собрать карточку: {exc}"))
@@ -540,13 +870,27 @@ async def _make_card(
         await status.delete()
     except Exception:
         pass
-    await message.answer_photo(FSInputFile(png))
-    parts = [str(data.get("title") or "Карточка товара")]
+    title = str(data.get("title") or "Карточка товара")
+    media = [
+        InputMediaPhoto(
+            media=FSInputFile(paths[0]),
+            caption=_fit(f"{title}\nСлайды 1/3 — обложка · 2/3 — детали · 3/3 — выгоды", 900),
+        )
+    ]
+    for path in paths[1:]:
+        media.append(InputMediaPhoto(media=FSInputFile(path)))
+    await message.answer_media_group(media)
+    parts = []
     if data.get("description"):
         parts.append(str(data["description"]))
     if data.get("keywords"):
         parts.append("Ключевые запросы:\n" + str(data["keywords"]))
-    await _reply_long(message, "\n\n".join(parts))
+    if parts:
+        await _reply_long(message, "\n\n".join(parts))
+    await message.answer(
+        "Готово: 3 слайда для маркетплейса. Можно сделать ещё или открыть меню.",
+        reply_markup=ui.card_inline(),
+    )
 
 
 async def _handle_question(message: Message, session: UserSession, text: str) -> None:

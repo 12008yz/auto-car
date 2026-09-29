@@ -5,7 +5,7 @@ Telegram-бот: работа с документами (чтение, вопр�
 ## Запуск
 
 1. Скопируйте `.env.example` в `.env`.
-2. Вставьте `TELEGRAM_BOT_TOKEN` и `LLM_API_KEY`.
+2. Вставьте `TELEGRAM_BOT_TOKEN` и `LLM_API_KEY` (AITunnel: base URL уже в `.env.example`).
 3. Для оплаты из РФ заполните UnitPay (`UNITPAY_*`) и `BILLING_PUBLIC_BASE_URL`
    (handler: `{BASE}/billing/unitpay`). Stars для EN работают без UnitPay.
 4. Запустите `run_bot.cmd`.

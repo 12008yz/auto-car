@@ -25,6 +25,7 @@ from billing.service import (
     get_rail,
 )
 from billing.skus import SKUS, Rail, get_sku
+from bot import ui
 from config import BILLING_ADMIN_IDS
 
 router = Router(name="billing")
@@ -46,7 +47,11 @@ async def cmd_plans(message: Message) -> None:
     lang = message.from_user.language_code
     ensure_user(message.from_user.id, lang)
     rail = get_rail(message.from_user.id, lang)
-    await message.answer(plans_text(_lang_ru(lang, rail)))
+    await message.answer(
+        plans_text(_lang_ru(lang, rail)),
+        parse_mode="HTML",
+        reply_markup=pay_keyboard(rail, _lang_ru(lang, rail)),
+    )
 
 
 @router.message(Command("balance"))
@@ -55,7 +60,11 @@ async def cmd_balance(message: Message) -> None:
         return
     lang = message.from_user.language_code
     ensure_user(message.from_user.id, lang)
-    await message.answer(balance_text(message.from_user.id, lang))
+    await message.answer(
+        balance_text(message.from_user.id, lang),
+        parse_mode="HTML",
+        reply_markup=ui.back_home_inline(),
+    )
 
 
 @router.message(Command("pay"))
@@ -67,19 +76,19 @@ async def cmd_pay(message: Message) -> None:
     rail = get_rail(message.from_user.id, lang)
     ru = _lang_ru(lang, rail)
     intro = (
-        "Выберите тариф. Рельс: ₽ UnitPay."
+        "<b>Оплата</b>\nВыберите тариф. Сейчас: ₽ UnitPay."
         if rail == "unitpay" and ru
         else (
-            "Choose a plan. Payment: Telegram Stars."
+            "<b>Payment</b>\nChoose a plan. Method: Telegram Stars."
             if rail == "stars" and not ru
             else (
-                "Выберите тариф. Оплата: Stars."
+                "<b>Оплата</b>\nВыберите тариф. Сейчас: Stars."
                 if rail == "stars"
-                else "Choose a plan. Payment: UnitPay (RUB)."
+                else "<b>Payment</b>\nChoose a plan. Method: UnitPay (RUB)."
             )
         )
     )
-    await message.answer(intro, reply_markup=pay_keyboard(rail, ru))
+    await message.answer(intro, parse_mode="HTML", reply_markup=pay_keyboard(rail, ru))
 
 
 @router.callback_query(F.data.startswith("rail:"))
