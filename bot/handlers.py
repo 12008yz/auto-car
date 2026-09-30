@@ -47,14 +47,20 @@ from edit.docx_patch import (
     write_structured_docx,
 )
 from llm.client import (
+    analyze_contract_risks,
+    apply_document_routing_guards,
     ask_document,
     check_document_gaps,
     classify_document_intent,
+    compare_documents,
+    extract_key_facts,
+    format_by_sample,
     generate_document,
     generate_product_photo,
     looks_like_card,
     looks_like_edit,
     looks_like_fill_data,
+    looks_like_tone,
     make_product_card,
     plan_edits,
     summarize_document,
@@ -532,6 +538,14 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             reply_markup=ui.docs_inline(),
         )
         return
+    if action == "docs_more_ex":
+        session.card_mode = False
+        await query.message.answer(
+            ui.docs_more_examples_text(),
+            parse_mode="HTML",
+            reply_markup=ui.docs_inline(),
+        )
+        return
     if action == "docs":
         session.card_mode = False
         await query.message.answer(
@@ -551,6 +565,27 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             )
             return
         await _handle_gaps(query.message, session)
+        return
+    if action == "risks":
+        if not session.index.files:
+            await query.message.answer(
+                "Сначала пришлите договор.",
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        await _handle_risks(query.message, session)
+        return
+    if action == "extract":
+        if not session.index.files:
+            await query.message.answer(
+                "Сначала пришлите документ.",
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        await _handle_extract(query.message, session)
+        return
+    if action == "compare":
+        await _handle_compare(query.message, session)
         return
     if action == "summary":
         if not session.index.files:
@@ -959,9 +994,15 @@ async def on_text(message: Message) -> None:
 
     has_files = bool(session.index.files)
     decision = classify_document_intent(text, has_files=has_files)
+    decision = apply_document_routing_guards(decision, text=text, has_files=has_files)
     intent = str(decision.get("intent") or "none")
     edit_mode = str(decision.get("mode") or "")
     fillish = looks_like_edit(text) or looks_like_fill_data(text)
+
+    # При файлах никогда не показываем clarify «бланк/текст» — это частый косяк
+    if has_files and intent == "clarify" and str(decision.get("family") or "") == "write":
+        intent = "ask"
+        decision = {**decision, "intent": "ask", "family": "ask", "guard": "handler_block_clarify"}
     # Продолжение заполнения, если в сессии уже копили данные
     if (
         has_files
@@ -977,16 +1018,49 @@ async def on_text(message: Message) -> None:
         intent = "edit"
         edit_mode = "fill"
 
+    if looks_like_tone(text) and has_files:
+        intent = "edit"
+        edit_mode = "tone"
+
     # Документная задача сильнее залипшего card_mode
-    if intent in {"edit", "ask", "check", "write_form", "write_text", "clarify"} or (
-        has_files and fillish
-    ):
+    if intent in {
+        "edit",
+        "ask",
+        "check",
+        "risks",
+        "extract",
+        "compare",
+        "format",
+        "write_form",
+        "write_text",
+        "clarify",
+    } or (has_files and fillish):
         session.card_mode = False
 
         if intent == "check":
             if not await _require_files(message, session):
                 return
             await _handle_gaps(message, session)
+            return
+
+        if intent == "risks":
+            if not await _require_files(message, session):
+                return
+            await _handle_risks(message, session)
+            return
+
+        if intent == "extract":
+            if not await _require_files(message, session):
+                return
+            await _handle_extract(message, session)
+            return
+
+        if intent == "compare":
+            await _handle_compare(message, session)
+            return
+
+        if intent == "format":
+            await _handle_format_sample(message, session)
             return
 
         if intent == "clarify" and not (has_files and fillish):
@@ -1016,12 +1090,12 @@ async def on_text(message: Message) -> None:
         if intent == "edit" or fillish:
             if not await _require_files(message, session):
                 return
-            await _handle_edit(
-                message,
-                session,
-                text,
-                mode="fill" if edit_mode == "fill" or looks_like_fill_data(text) else "edit",
-            )
+            mode = "auto"
+            if edit_mode == "fill" or looks_like_fill_data(text):
+                mode = "fill"
+            elif edit_mode == "tone" or looks_like_tone(text):
+                mode = "tone"
+            await _handle_edit(message, session, text, mode=mode)
             return
 
         # ask / вопрос по файлу
@@ -1358,6 +1432,184 @@ async def _handle_gaps(message: Message, session: UserSession) -> None:
     await _finish_status(status, message, text)
 
 
+async def _handle_risks(message: Message, session: UserSession) -> None:
+    charge = await _require_quota(message, "ask")
+    if charge is None:
+        return
+    status = await message.answer("Разбираю договор на риски…")
+    try:
+        async with session.lock:
+            chunks = _chunks_for_active(session, limit=24)
+        if not chunks:
+            _refund(message, charge, "ask")
+            await status.edit_text("В файле нет текста.")
+            return
+        text = await asyncio.to_thread(analyze_contract_risks, chunks)
+    except Exception as exc:
+        _refund(message, charge, "ask")
+        await status.edit_text(_fit(f"Не удалось разобрать договор: {exc}"))
+        return
+    session.remember_doc_task("ask", "риски договора")
+    await _finish_status(status, message, text)
+
+
+async def _handle_extract(message: Message, session: UserSession) -> None:
+    charge = await _require_quota(message, "ask")
+    if charge is None:
+        return
+    status = await message.answer("Собираю стороны, даты и суммы…")
+    try:
+        async with session.lock:
+            chunks = _chunks_for_active(session, limit=24)
+        if not chunks:
+            _refund(message, charge, "ask")
+            await status.edit_text("В файле нет текста.")
+            return
+        text = await asyncio.to_thread(extract_key_facts, chunks)
+    except Exception as exc:
+        _refund(message, charge, "ask")
+        await status.edit_text(_fit(f"Не удалось извлечь факты: {exc}"))
+        return
+    session.remember_doc_task("ask", "факты")
+    await _finish_status(status, message, text)
+
+
+def _chunks_for_active(session: UserSession, limit: int = 20) -> list:
+    if session.active_path is not None:
+        for item in session.index.files:
+            if item.path == session.active_path and item.chunks:
+                step = max(1, len(item.chunks) // limit) if len(item.chunks) > limit else 1
+                return item.chunks[::step][:limit]
+    return session.index.preview_chunks(limit)
+
+
+def _pick_two_files(session: UserSession) -> tuple | None:
+    files = list(session.index.files)
+    if len(files) < 2:
+        return None
+    if session.active_path is not None:
+        a = next((f for f in files if f.path == session.active_path), None)
+        b = next((f for f in reversed(files) if a is None or f.path != a.path), None)
+        if a and b:
+            return a, b
+    return files[-2], files[-1]
+
+
+async def _handle_compare(message: Message, session: UserSession) -> None:
+    pair = _pick_two_files(session)
+    if pair is None:
+        await message.answer(
+            "Для сравнения нужно минимум <b>2 файла</b> в чате.\n"
+            "Пришлите второй документ, затем напишите «Сравни эти два файла».",
+            parse_mode="HTML",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+    file_a, file_b = pair
+    charge = await _require_quota(message, "ask")
+    if charge is None:
+        return
+    status = await message.answer(
+        f"Сравниваю:\n• {file_a.name}\n• {file_b.name}"
+    )
+    try:
+        chunks_a = file_a.chunks[:: max(1, len(file_a.chunks) // 18)][:18] if file_a.chunks else []
+        chunks_b = file_b.chunks[:: max(1, len(file_b.chunks) // 18)][:18] if file_b.chunks else []
+        if not chunks_a or not chunks_b:
+            _refund(message, charge, "ask")
+            await status.edit_text("В одном из файлов нет текста.")
+            return
+        text = await asyncio.to_thread(
+            compare_documents,
+            chunks_a,
+            chunks_b,
+            file_a.name,
+            file_b.name,
+        )
+    except Exception as exc:
+        _refund(message, charge, "ask")
+        await status.edit_text(_fit(f"Не удалось сравнить: {exc}"))
+        return
+    session.remember_doc_task("ask", "сравнение")
+    await _finish_status(status, message, text)
+
+
+async def _handle_format_sample(message: Message, session: UserSession) -> None:
+    pair = _pick_two_files(session)
+    if pair is None:
+        await message.answer(
+            "Нужны <b>2 файла</b>: содержание и образец оформления.\n"
+            "Пришлите оба, затем: «Оформи по образцу».",
+            parse_mode="HTML",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+    content_f, sample_f = pair
+    # Активный = содержание, второй = образец (если active задан)
+    if session.active_path is not None:
+        for item in session.index.files:
+            if item.path == session.active_path:
+                content_f = item
+                break
+        sample_f = next(
+            (f for f in session.index.files if f.path != content_f.path),
+            sample_f,
+        )
+    charge = await _require_quota(message, "write")
+    if charge is None:
+        return
+    status = await message.answer(
+        f"Оформляю «{content_f.name}» по образцу «{sample_f.name}»…"
+    )
+    dest: Path | None = None
+    data: dict[str, Any] = {}
+    try:
+        c_chunks = content_f.chunks[:: max(1, len(content_f.chunks) // 16)][:16]
+        s_chunks = sample_f.chunks[:: max(1, len(sample_f.chunks) // 12)][:12]
+        if not c_chunks:
+            _refund(message, charge, "write")
+            await status.edit_text("В файле содержания нет текста.")
+            return
+        data = await asyncio.to_thread(format_by_sample, c_chunks, s_chunks or c_chunks)
+        dest_dir = session.user_dir(DATA_DIR)
+        fname = suggest_filename(
+            str(data.get("filename_stem") or data.get("title") or "document"),
+            str(data.get("doc_type") or "document"),
+        )
+        dest = dest_dir / fname
+        n = 1
+        while dest.exists():
+            dest = dest_dir / f"{Path(fname).stem}_{n}.docx"
+            n += 1
+        await asyncio.to_thread(
+            write_structured_docx,
+            dest,
+            title=str(data.get("title") or "Документ"),
+            sections=list(data.get("sections") or []),
+            doc_type=str(data.get("doc_type") or ""),
+            layout="text",
+        )
+        async with session.lock:
+            await asyncio.to_thread(_ingest_path, session, dest)
+    except Exception as exc:
+        _refund(message, charge, "write")
+        await status.edit_text(_fit(f"Не удалось оформить: {exc}"))
+        return
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    assert dest is not None
+    session.remember_doc_task("write", "оформление по образцу")
+    await message.answer_document(
+        FSInputFile(dest),
+        caption=_fit(
+            f"{data.get('title') or dest.name}\n"
+            "Оформлено по образцу (.docx). Откройте в Word."
+        ),
+    )
+
+
 async def _handle_edit(
     message: Message,
     session: UserSession,
@@ -1378,14 +1630,26 @@ async def _handle_edit(
         return
 
     fill_mode = mode == "fill" or looks_like_fill_data(text)
+    tone_mode = mode == "tone" or looks_like_tone(text)
     if fill_mode:
         session.remember_doc_task("fill", text, accumulate_facts=True)
         instruction = session.fill_instruction(text)
         status_msg = "Готовлю заполнение бланка…"
+        edit_mode = "fill"
+    elif tone_mode:
+        session.remember_doc_task("edit", text)
+        instruction = (
+            f"{text}\n\n"
+            "Перепиши/подправь текст документа в нужном тоне, "
+            "сохраняя факты, даты, суммы и ФИО."
+        )
+        status_msg = "Готовлю смену тона / сокращение…"
+        edit_mode = "tone"
     else:
         session.remember_doc_task("edit", text)
         instruction = text
         status_msg = "Готовлю план правок…"
+        edit_mode = "edit"
 
     charge = await _require_quota(message, "edit")
     if charge is None:
@@ -1394,7 +1658,7 @@ async def _handle_edit(
     try:
         async with session.lock:
             # Для заполнения лучше широкий контекст бланка, не только поиск по ФИО
-            if fill_mode:
+            if fill_mode or tone_mode:
                 hits = [Hit(chunk=c, score=1.0) for c in session.index.preview_chunks(16)]
                 more = await asyncio.to_thread(session.index.search, instruction)
                 seen = {h.chunk.text[:80] for h in hits}
@@ -1420,7 +1684,7 @@ async def _handle_edit(
             hits,
             active.name,
             True,
-            "fill" if fill_mode else "edit",
+            edit_mode,
         )
     except Exception as exc:
         _refund(message, charge, "edit")

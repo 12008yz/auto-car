@@ -363,6 +363,109 @@ def check_document_gaps(chunks: list[Chunk]) -> str:
     return _chat(system, _format_chunks(chunks), temperature=0.2)
 
 
+def analyze_contract_risks(chunks: list[Chunk]) -> str:
+    """Типовая проверка договора: риски и спорные места."""
+    system = (
+        "Ты помощник по разбору договоров (не юрист, не консультация). "
+        "По фрагментам составь на русском структурированный разбор:\n"
+        "1) Стороны и предмет (если видно)\n"
+        "2) Сроки и этапы\n"
+        "3) Оплата / аванс / НДС\n"
+        "4) Приёмка / акты\n"
+        "5) Ответственность / штрафы / неустойка\n"
+        "6) Расторжение / односторонний отказ\n"
+        "7) Подсудность / претензионный порядок\n"
+        "8) Что опасно или неясн о — список рисков с цитатой/отсылкой к фрагменту\n"
+        "9) Чего не хватает в тексте (если заметно)\n"
+        "Не выдумывай пунктов, которых нет во фрагментах. "
+        "В конце одной строкой: «Это черновик разбора, не юридическая консультация»."
+    )
+    return _chat(system, _format_chunks(chunks), temperature=0.25)
+
+
+def extract_key_facts(chunks: list[Chunk]) -> str:
+    """Выжимка фактов: стороны, даты, суммы, обязательства."""
+    system = (
+        "Извлеки из фрагментов ключевые факты на русском в виде компактных списков:\n"
+        "• Стороны / ФИО / организации\n"
+        "• Даты и сроки\n"
+        "• Суммы / валюта / порядок оплаты\n"
+        "• Адреса / реквизиты (если есть)\n"
+        "• Главные обязательства\n"
+        "Формат: маркированные списки. Если данных нет — «не указано». Не выдумывай."
+    )
+    return _chat(system, _format_chunks(chunks), temperature=0.2)
+
+
+def compare_documents(
+    chunks_a: list[Chunk],
+    chunks_b: list[Chunk],
+    name_a: str,
+    name_b: str,
+) -> str:
+    """Сравнение двух документов."""
+    system = (
+        "Сравни два документа на русском. Выдели:\n"
+        "1) Общее (о чём оба)\n"
+        "2) Важные отличия: сроки, суммы, стороны, обязанности, штрафы, формулировки\n"
+        "3) Что есть только в первом / только во втором\n"
+        "4) На что обратить внимание при согласовании\n"
+        "Не выдумывай. Если фрагментов мало — скажи, что сравнение частичное."
+    )
+    user = (
+        f"=== Документ A: {name_a} ===\n{_format_chunks(chunks_a)}\n\n"
+        f"=== Документ B: {name_b} ===\n{_format_chunks(chunks_b)}"
+    )
+    return _chat(system, user, temperature=0.25)
+
+
+def format_by_sample(content_chunks: list[Chunk], sample_chunks: list[Chunk]) -> dict[str, Any]:
+    """
+    Оформить содержание «как в образце» — новый структурированный документ.
+    """
+    system = (
+        "Нужно оформить СОДЕРЖАНИЕ первого документа в стиле/структуре ОБРАЗЦА "
+        "(второй). Верни JSON:\n"
+        '{"title":str,"doc_type":str,"filename_stem":str,'
+        '"sections":[{"heading":str,"paragraphs":[str]}]}\n'
+        "Сохраняй факты и смысл из содержания, не копируй чужие ФИО/реквизиты из образца "
+        "если их нет в содержании. Структура (заголовки, блоки) — ближе к образцу. "
+        "Пиши по-русски."
+    )
+    user = (
+        f"=== СОДЕРЖАНИЕ ===\n{_format_chunks(content_chunks)}\n\n"
+        f"=== ОБРАЗЕЦ ОФОРМЛЕНИЯ ===\n{_format_chunks(sample_chunks)}"
+    )
+    raw = _chat(system, user, temperature=0.35)
+    try:
+        data = _extract_json(raw)
+    except Exception as exc:
+        raise RuntimeError(f"Не разобрать ответ модели: {exc}") from exc
+    title = str(data.get("title") or "Документ по образцу").strip()[:200]
+    sections_raw = data.get("sections") or []
+    sections: list[dict[str, Any]] = []
+    if isinstance(sections_raw, list):
+        for item in sections_raw:
+            if not isinstance(item, dict):
+                continue
+            heading = str(item.get("heading") or "").strip()[:120]
+            paras_in = item.get("paragraphs") or []
+            if isinstance(paras_in, str):
+                paras_in = [paras_in]
+            paragraphs = [str(p).strip() for p in paras_in if str(p).strip()]
+            if heading or paragraphs:
+                sections.append({"heading": heading, "paragraphs": paragraphs})
+    if not sections:
+        raise RuntimeError("Модель вернула пустой документ")
+    return {
+        "title": title,
+        "doc_type": str(data.get("doc_type") or "документ").strip()[:40],
+        "filename_stem": str(data.get("filename_stem") or title).strip()[:80],
+        "sections": sections,
+        "mode": "text",
+    }
+
+
 def _extract_person_facts(instruction: str) -> dict[str, str]:
     """Достаёт ФИО / дату / год / город из свободной фразы пользователя."""
     text = (instruction or "").strip()
@@ -557,6 +660,7 @@ def plan_edits(
             "в файле нужно",
         )
     )
+    is_tone = mode == "tone" or looks_like_tone(instr_l)
     facts = _extract_person_facts(instruction) if is_fill else {}
     system = (
         "Ты аккуратный редактор Word-документов. Задача — выполнить инструкцию "
@@ -598,6 +702,15 @@ def plan_edits(
             "find = точный текст/плейсхолдер из фрагментов; replace = значение.\n"
             "summary: перечисли «поле → значение»."
         )
+    if is_tone:
+        system += (
+            "\n\nРЕЖИМ СМЕНЫ ТОНА / СОКРАЩЕНИЯ:\n"
+            "Пользователь просит изменить стиль текста файла (короче / официальнее / проще).\n"
+            "• Предпочти kind=rewrite с полным новым текстом того же смысла, "
+            "если правок много; иначе точечные patch по абзацам.\n"
+            "• Не меняй факты, даты, суммы, ФИО, если не просили.\n"
+            "• Сохрани деловой смысл документа."
+        )
     facts_block = ""
     if facts:
         facts_block = (
@@ -608,7 +721,7 @@ def plan_edits(
     hits_blob = _format_hits(hits)
     extra = (
         f"Активный файл: {filename}. Это DOCX: {is_docx}. "
-        f"Режим: {'заполнение' if is_fill else 'правка'}.\n"
+        f"Режим: {'заполнение' if is_fill else 'тон' if is_tone else 'правка'}.\n"
         f"Инструкция пользователя:\n{instruction}\n"
         f"{facts_block}\n"
         f"Фрагменты:\n{hits_blob}"
@@ -667,7 +780,7 @@ def plan_edits(
         "summary": summary,
         "patches": patches[:12],
         "rewrite_text": str(data.get("rewrite_text") or "").strip(),
-        "mode": "fill" if is_fill else "edit",
+        "mode": "fill" if is_fill else "tone" if is_tone else "edit",
         "facts": facts,
     }
 
@@ -786,17 +899,269 @@ def looks_like_fill_data(text: str) -> bool:
     return False
 
 
+def looks_like_tone(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        k in lowered
+        for k in (
+            "сделай короче",
+            "сократи текст",
+            "сократи документ",
+            "официальнее",
+            "более официальн",
+            "проще язык",
+            "упрости текст",
+            "дружелюбнее",
+            "смени тон",
+            "измени тон",
+            "перепиши официальн",
+            "перепиши коротк",
+            "тон письма",
+            "сделай проще",
+        )
+    )
+
+
 def looks_like_write(text: str) -> bool:
     """Создание документа без уточнения (бланк или текст)."""
     intent = classify_document_intent(text, has_files=False)
     return intent["intent"] in {"write_form", "write_text"}
 
 
+_STRONG_CREATE = (
+    "напиши",
+    "написать",
+    "создай",
+    "создать",
+    "составь",
+    "составить",
+    "сгенерируй",
+    "подготовь",
+    "сформируй",
+    "оформи документ",
+    "оформи файл",
+    "сделай бланк",
+    "сделай файл",
+    "сделай документ",
+    "сделай реферат",
+    "сделай письмо",
+    "сделай претензи",
+    "новый документ",
+    "новый файл",
+)
+
+_SOFT_NEED = ("нужно", "нужна", "нужен", "надо", "хочу", "можно", "помоги", "пожалуйста")
+
+_DOC_QUESTION = (
+    "проверь информац",
+    "проверить информац",
+    "проверь данн",
+    "проверить данн",
+    "проверь фио",
+    "проверь что в",
+    "посмотри что",
+    "посмотри внутри",
+    "что там внутри",
+    "что внутри",
+    "что в файл",
+    "что в договор",
+    "что в документ",
+    "что в текст",
+    "расскажи что в",
+    "объясни что в",
+    "информация о человек",
+    "информацию о человек",
+    "о человеке",
+    "данные о человек",
+    "верно ли",
+    "правильн ли",
+    "сверь данн",
+    "сверь фио",
+    "найди в файл",
+    "есть ли в договор",
+    "есть ли в документ",
+    "есть ли в файл",
+    "какой срок",
+    "какая сумм",
+    "кто сторон",
+    "мне нужно что бы ты проверил",
+    "мне нужно чтобы ты проверил",
+    "нужно чтобы ты проверил",
+    "нужно что бы ты проверил",
+)
+
+
+def has_strong_create(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(k in lowered for k in _STRONG_CREATE)
+
+
+def looks_like_doc_question(text: str) -> bool:
+    """Вопрос/проверка по уже загруженному документу (не создание)."""
+    lowered = (text or "").lower()
+    if any(k in lowered for k in _DOC_QUESTION):
+        return True
+    if any(k in lowered for k in ("где указан", "где написан", "указан ли", "написано ли")):
+        return True
+    # «проверь …» без явного создания документа
+    if ("проверь" in lowered or "проверить" in lowered) and not has_strong_create(lowered):
+        if not any(k in lowered for k in ("риск", "бланк", "поля")):
+            return True
+    return False
+
+
+def apply_document_routing_guards(
+    decision: dict[str, Any],
+    *,
+    text: str,
+    has_files: bool,
+) -> dict[str, Any]:
+    """
+    Страховка от типичных косяков роутера.
+    Главное правило: если файлы уже в чате — почти никогда не спрашиваем
+    «бланк или текст?»; по умолчанию работаем с загруженным документом.
+    """
+    intent = str(decision.get("intent") or "none")
+    family = str(decision.get("family") or "")
+    mode = str(decision.get("mode") or "")
+    lowered = (text or "").lower()
+    strong = has_strong_create(lowered)
+    soft = any(k in lowered for k in _SOFT_NEED)
+    questionish = looks_like_doc_question(lowered)
+    fillish = looks_like_fill_data(lowered) or looks_like_edit(lowered)
+    toneish = looks_like_tone(lowered)
+
+    if has_files:
+        # 1) Clarify create при файлах — почти всегда ошибка
+        if intent == "clarify" and family == "write" and not strong:
+            return {
+                "intent": "ask",
+                "confidence": 0.85,
+                "mode": "",
+                "family": "ask",
+                "guard": "files_block_write_clarify",
+            }
+        if intent == "clarify" and family == "write" and strong and questionish:
+            return {
+                "intent": "ask",
+                "confidence": 0.8,
+                "mode": "",
+                "family": "ask",
+                "guard": "question_beats_create_clarify",
+            }
+
+        # 2) write_* без явного создания — вопрос/правка
+        if intent in {"write_form", "write_text"} and not strong:
+            if fillish:
+                return {
+                    "intent": "edit",
+                    "confidence": 0.9,
+                    "mode": "fill" if looks_like_fill_data(lowered) else "edit",
+                    "family": "edit",
+                    "guard": "files_soft_write_to_edit",
+                }
+            return {
+                "intent": "ask",
+                "confidence": 0.85,
+                "mode": "",
+                "family": "ask",
+                "guard": "files_soft_write_to_ask",
+            }
+
+        # 3) Вопрос/проверка важнее создания (но не ломаем явный write с сильным глаголом)
+        if (
+            questionish
+            and intent in {"clarify", "write_form", "write_text", "none", "card"}
+            and not (strong and intent in {"write_form", "write_text"})
+        ):
+            if fillish:
+                return {
+                    "intent": "edit",
+                    "confidence": 0.88,
+                    "mode": "fill" if looks_like_fill_data(lowered) else mode or "edit",
+                    "family": "edit",
+                    "guard": "question_with_fill",
+                }
+            return {
+                "intent": "ask",
+                "confidence": 0.88,
+                "mode": "",
+                "family": "ask",
+                "guard": "files_question_default",
+            }
+
+        # 4) Тон / правка
+        if toneish and intent not in {"edit", "check", "risks", "extract", "compare"}:
+            return {
+                "intent": "edit",
+                "confidence": 0.9,
+                "mode": "tone",
+                "family": "edit",
+                "guard": "tone_override",
+            }
+        if fillish and intent in {"ask", "none", "clarify", "card"}:
+            return {
+                "intent": "edit",
+                "confidence": 0.9,
+                "mode": "fill" if looks_like_fill_data(lowered) else "edit",
+                "family": "edit",
+                "guard": "fill_beats_ask",
+            }
+
+        # 5) Пустой/слабый intent при файлах → ask
+        if intent in {"none", ""}:
+            return {
+                "intent": "ask",
+                "confidence": 0.7,
+                "mode": "",
+                "family": "ask",
+                "guard": "files_default_ask",
+            }
+
+        # 6) Карточка не должна съедать документный контекст без явного товара
+        if intent == "card" and (questionish or fillish or soft) and not looks_like_card(lowered):
+            return {
+                "intent": "ask",
+                "confidence": 0.8,
+                "mode": "",
+                "family": "ask",
+                "guard": "block_sticky_card_like",
+            }
+
+    else:
+        # Без файлов: «проверь информацию» → попросить файл, не бланк/текст
+        if questionish and intent in {"clarify", "write_form", "write_text", "none"} and not strong:
+            return {
+                "intent": "clarify",
+                "confidence": 0.75,
+                "mode": "",
+                "family": "ask",
+                "question": "Пришлите документ в чат — проверю по нему.",
+                "options": [
+                    {"id": "need_file", "label": "Сейчас пришлю файл"},
+                    {"id": "write_text", "label": "Нет, создай новый текст"},
+                ],
+                "guard": "no_files_question",
+            }
+
+    decision = dict(decision)
+    decision.setdefault("guard", "")
+    return decision
+
+
 def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str, Any]:
     """
-    Быстрый роутер намерений для документов.
-    intent: card | write_form | write_text | edit | ask | clarify | none
+    Быстрый роутер намерений + страховка apply_document_routing_guards.
+    intent: card | write_form | write_text | edit | ask | check | risks |
+            extract | compare | format | clarify | none
     """
+    raw = (text or "").strip()
+    decision = _classify_document_intent_raw(raw, has_files=has_files)
+    return apply_document_routing_guards(decision, text=raw, has_files=has_files)
+
+
+def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict[str, Any]:
+    """Сырой эвристический роутер (без финальных guards)."""
     raw = (text or "").strip()
     lowered = raw.lower()
     if not lowered:
@@ -830,6 +1195,15 @@ def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str,
         "статья",
         "на тему",
         "по теме",
+        "претензи",
+        "письмо ",
+        "деловое письмо",
+        "коммерческое предложен",
+        " кп ",
+        "напиши кп",
+        "сделай кп",
+        "служебную записк",
+        "объяснительн",
     )
     write_verbs = (
         "напиши",
@@ -881,6 +1255,7 @@ def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str,
     has_text = any(k in lowered for k in text_keys)
     has_write_verb = any(v in lowered for v in write_verbs)
     has_edit = any(k in lowered for k in edit_keys) or looks_like_fill_data(lowered)
+    has_tone = looks_like_tone(lowered)
 
     # При загруженном файле правка/заполнение — не новый документ и не «поиск»
     if has_files and has_edit:
@@ -891,6 +1266,14 @@ def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str,
             "intent": "edit",
             "confidence": 0.93,
             "mode": "fill" if fill else "edit",
+            "family": "edit",
+        }
+
+    if has_files and has_tone:
+        return {
+            "intent": "edit",
+            "confidence": 0.9,
+            "mode": "tone",
             "family": "edit",
         }
 
@@ -913,6 +1296,125 @@ def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str,
         k in lowered
         for k in ("про декларац", "о декларац", "что такое", "расскажи", "объясни")
     )
+
+    # Сравнение двух документов
+    if any(
+        k in lowered
+        for k in (
+            "сравни",
+            "сравнить",
+            "чем отлича",
+            "отличия между",
+            "разница между",
+            "что изменилось",
+            "diff",
+        )
+    ):
+        return {
+            "intent": "compare",
+            "confidence": 0.9,
+            "mode": "",
+            "family": "ask",
+        }
+
+    # Оформление по образцу
+    if any(
+        k in lowered
+        for k in (
+            "по образцу",
+            "как в образце",
+            "оформи по",
+            "по форме",
+            "по госту",
+            "по гост",
+            "в таком же оформлен",
+        )
+    ):
+        return {
+            "intent": "format",
+            "confidence": 0.88,
+            "mode": "sample",
+            "family": "write",
+        }
+
+    # Риски договора
+    if any(
+        k in lowered
+        for k in (
+            "проверь договор",
+            "риски договор",
+            "риски в договор",
+            "найди риски",
+            "опасные пункт",
+            "что опасн",
+            "разбери договор",
+            "анализ договор",
+            "проверь на риски",
+            "юридическ риск",
+        )
+    ) or (
+        has_files
+        and "договор" in lowered
+        and any(k in lowered for k in ("риск", "проверь", "разбери", "анализ"))
+    ):
+        return {
+            "intent": "risks",
+            "confidence": 0.92,
+            "mode": "",
+            "family": "ask",
+        }
+
+    # Выжимка фактов
+    if any(
+        k in lowered
+        for k in (
+            "вытащи факт",
+            "извлеки факт",
+            "ключевые факт",
+            "выпиши даты",
+            "выпиши сумм",
+            "стороны и сумм",
+            "стороны, даты",
+            "стороны даты",
+            "даты и суммы",
+            "даты и сумм",
+            "сводка по документ",
+            "выписка из документ",
+            "что за стороны",
+        )
+    ) or (
+        any(k in lowered for k in ("вытащи", "извлеки", "выпиши", "собери"))
+        and any(k in lowered for k in ("сторон", "сумм", "даты", "срок", "реквизит", "факт"))
+    ):
+        return {
+            "intent": "extract",
+            "confidence": 0.9,
+            "mode": "",
+            "family": "ask",
+        }
+
+    # Проверка данных / информации в уже загруженном файле
+    if has_files and any(
+        k in lowered
+        for k in (
+            "проверь информац",
+            "проверить информац",
+            "проверь данн",
+            "проверить данн",
+            "проверь фио",
+            "сверь данн",
+            "сверь фио",
+            "верно ли",
+            "правильн ли",
+            "информация о человек",
+            "информацию о человек",
+            "о человеке",
+            "данные о человек",
+            "проверь что в файл",
+            "посмотри данные",
+        )
+    ):
+        return {"intent": "ask", "confidence": 0.9, "mode": "", "family": "ask"}
 
     # Проверка пустых полей бланка
     if has_files and any(
@@ -941,7 +1443,7 @@ def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str,
         return {
             "intent": "edit" if has_files else "clarify",
             "confidence": 0.92 if has_files else 0.7,
-            "mode": "",
+            "mode": "fill" if looks_like_fill_data(lowered) else "",
             "family": "edit",
             "question": "Нужно поправить уже загруженный Word-файл?"
             if not has_files
@@ -1016,7 +1518,21 @@ def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str,
                 "family": "write",
             }
 
-        if has_text or (has_write_verb and any(k in lowered for k in ("реферат", "эссе", "доклад", "сочинен"))):
+        if has_text or (
+            has_write_verb
+            and any(
+                k in lowered
+                for k in (
+                    "реферат",
+                    "эссе",
+                    "доклад",
+                    "сочинен",
+                    "претензи",
+                    "письмо",
+                    "коммерческ",
+                )
+            )
+        ):
             return {
                 "intent": "write_text",
                 "confidence": 0.9,
@@ -1031,6 +1547,33 @@ def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str,
                     "confidence": 0.75,
                     "mode": "form",
                     "family": "write",
+                }
+            # «Мне нужно, чтобы ты проверил…» при загруженном файле —
+            # это вопрос/проверка, а не создание бланка/текста.
+            strong_create = any(
+                v in lowered
+                for v in (
+                    "напиши",
+                    "написать",
+                    "создай",
+                    "составь",
+                    "сгенерируй",
+                    "подготовь",
+                    "сформируй",
+                    "оформи",
+                    "сделай бланк",
+                    "сделай файл",
+                    "сделай документ",
+                    "сделай реферат",
+                    "сделай письмо",
+                )
+            )
+            if has_files and not strong_create and not has_text:
+                return {
+                    "intent": "ask",
+                    "confidence": 0.75,
+                    "mode": "",
+                    "family": "ask",
                 }
             return {
                 "intent": "clarify",
@@ -1110,7 +1653,8 @@ def generate_document(prompt: str, mode: str = "auto") -> dict[str, Any]:
         "Верни только JSON:\n"
         '{"title":str,"doc_type":str,"filename_stem":str,'
         '"sections":[{"heading":str,"paragraphs":[str]}]}\n\n'
-        "doc_type: реферат|эссе|доклад|отчёт|сочинение|письмо|декларация|"
+        "doc_type: реферат|эссе|доклад|отчёт|сочинение|письмо|претензия|"
+        "коммерческое|декларация|"
         "заявление|справка|титульный|договор|другое\n"
         "filename_stem: короткое имя файла без расширения.\n\n"
         "КРИТИЧНО — сначала определи тип запроса:\n"
@@ -1135,9 +1679,11 @@ def generate_document(prompt: str, mode: str = "auto") -> dict[str, Any]:
         "   • Подпись / дата: [подпись] / [ДД.ММ.ГГГГ]\n"
         "   В начале одной строкой: «Типовой шаблон для заполнения, не официальный бланк ФНС».\n"
         "   Если просят ТОЛЬКО первый титульный лист — не добавляй остальные разделы декларации.\n\n"
-        "B) УЧЕБНЫЙ ТЕКСТ (реферат, эссе, доклад)\n"
-        "   Тогда пиши связный оригинальный текст (5–8 разделов / введение–заключение),\n"
-        "   своими словами, без копипаста, можно ориентировочный список литературы.\n\n"
+        "B) СВЯЗНЫЙ ТЕКСТ (реферат, эссе, доклад, письмо, претензия, КП)\n"
+        "   Письмо / претензия / коммерческое предложение — деловой тон, чёткие блоки "
+        "(адресат, суть, требования/условия, подпись).\n"
+        "   Учебный текст — 5–8 разделов / введение–заключение, своими словами, "
+        "без копипаста, можно ориентировочный список литературы.\n\n"
         "Общие правила:\n"
         "• Не выдумывай чужие ФИО, ИНН, адреса — только плейсхолдеры.\n"
         "• Не выдавай шаблон за юридическую консультацию.\n"
