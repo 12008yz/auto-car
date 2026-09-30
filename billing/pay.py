@@ -14,14 +14,15 @@ def plans_text(lang_ru: bool = True) -> str:
         lines = [
             "<b>Тарифы</b>",
             "",
-            "<b>Free</b> — до 100 запросов / summary / карточек в день, без правок Word",
+            "<b>Free</b> — до 100 вопросов / summary / карточек в день, "
+            "до 15 генераций текста (реферат и т.п.), без правок Word",
             "<b>Pro</b> (30 дней) — пул кредитов + правки .docx",
-            "<b>Пакеты кредитов</b> — докупка (кроме правок Word)",
+            "<b>Пакеты кредитов</b> — докупка (правки Word только на Pro)",
             "",
         ]
         for sku in SKUS.values():
             lines.append(
-                f"• <b>{sku.title_ru}</b> — {sku.price_rub:.0f} ₽ / {sku.price_stars} Stars"
+                f"• <b>{sku.title_ru}</b> — {sku.price_rub:.0f} ₽ / {sku.price_stars} ⭐"
                 + (f", +{sku.credits} кр." if sku.credits else "")
             )
         lines.append("")
@@ -64,7 +65,8 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
             lines.append(
                 f"Вопросы {info.daily_ask}/{info.daily_ask_limit} · "
                 f"summary {info.daily_summary}/{info.daily_summary_limit} · "
-                f"карточки {info.daily_card}/{info.daily_card_limit}"
+                f"карточки {info.daily_card}/{info.daily_card_limit} · "
+                f"тексты {info.daily_write}/{info.daily_write_limit}"
             )
         return "\n".join(lines)
     lines = [
@@ -82,7 +84,8 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
         lines.append(
             f"Asks {info.daily_ask}/{info.daily_ask_limit} · "
             f"summary {info.daily_summary}/{info.daily_summary_limit} · "
-            f"cards {info.daily_card}/{info.daily_card_limit}"
+            f"cards {info.daily_card}/{info.daily_card_limit} · "
+            f"writes {info.daily_write}/{info.daily_write_limit}"
         )
     return "\n".join(lines)
 

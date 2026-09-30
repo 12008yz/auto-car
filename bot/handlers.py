@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Iterable
 from html import escape
@@ -24,17 +25,36 @@ from aiogram.types import (
 from billing.pay import upsell_keyboard
 from billing.service import ConsumeResult, consume, ensure_user, refund_consume
 from billing.skus import Action
-from bot.session import PendingEdit, UserSession, clear_user_workspace, get_session
+from bot.media import extract_video_frame
+from bot.session import PendingClarify, PendingEdit, UserSession, clear_user_workspace, get_session
 from bot import ui
+from card.prepare import prepare_fallback_cutout, prepare_studio_product
 from card.render import render_product_card_pack
+from card.styles import (
+    VARIANTS,
+    VARIANT_TITLES,
+    bump_card_count,
+    peek_variant,
+    scene_for_product,
+)
 from config import ALLOWED_SUFFIXES, DATA_DIR, IMAGE_SUFFIXES, MAX_FILE_BYTES, TELEGRAM_MAX_LEN
 from docs.loaders import load_document
-from edit.docx_patch import apply_patches, write_rewrite_docx
+from edit.docx_patch import (
+    apply_patches,
+    filter_valid_patches,
+    suggest_filename,
+    write_rewrite_docx,
+    write_structured_docx,
+)
 from llm.client import (
     ask_document,
+    check_document_gaps,
+    classify_document_intent,
+    generate_document,
     generate_product_photo,
     looks_like_card,
     looks_like_edit,
+    looks_like_fill_data,
     make_product_card,
     plan_edits,
     summarize_document,
@@ -42,6 +62,7 @@ from llm.client import (
 from rag.pipeline import Hit, chunk_blocks
 
 router = Router()
+log = logging.getLogger(__name__)
 
 
 class _TrackChatMessagesMiddleware(BaseMiddleware):
@@ -246,7 +267,8 @@ def _edit_keyboard() -> InlineKeyboardMarkup:
 def _describe_plan(pending: PendingEdit) -> str:
     lines = [pending.summary or "План правок готов."]
     if pending.kind == "patch" and pending.patches:
-        lines.append("Замены:")
+        lines.append("")
+        lines.append("Что изменится:")
         for i, patch in enumerate(pending.patches[:12], start=1):
             find = patch.get("find") or ""
             replace = patch.get("replace") or ""
@@ -257,6 +279,11 @@ def _describe_plan(pending: PendingEdit) -> str:
             lines.append(f"{i}. «{find}» → «{replace}»")
         if len(pending.patches) > 12:
             lines.append(f"… и ещё {len(pending.patches) - 12}")
+        lines.append("")
+        lines.append(
+            "Проверьте соответствия (дата рождения — целиком ДД.ММ.ГГГГ, "
+            "город — в поле адреса/города, не путаем с отчётным годом)."
+        )
     elif pending.kind == "rewrite" and pending.rewrite_text:
         preview = pending.rewrite_text.strip()
         if len(preview) > 900:
@@ -391,6 +418,7 @@ async def on_menu_button(message: Message) -> None:
         )
         return
     if text == ui.BTN_DOCS:
+        session.card_mode = False
         await message.answer(
             ui.docs_prompt_text(),
             parse_mode="HTML",
@@ -427,9 +455,9 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         return
     if action == "clear_no":
         try:
-            await query.message.edit_text("Очистка отменена.")
+            await query.message.edit_text("Ок, ничего не удаляю.")
         except Exception:
-            await query.message.answer("Очистка отменена.")
+            await query.message.answer("Ок, ничего не удаляю.")
         return
     if action == "clear_yes":
         chat_id = query.message.chat.id
@@ -437,7 +465,8 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         known = list(session.chat_message_ids)
         known.append(up_to)
         try:
-            await query.message.edit_text("Очищаю переписку…")
+            await query.message.edit_text("Очищаю чат…")
+
         except Exception:
             pass
         clear_user_workspace(query.from_user.id, DATA_DIR)
@@ -479,7 +508,32 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             reply_markup=ui.card_inline(),
         )
         return
+    if action == "docs_form_ex":
+        session.card_mode = False
+        await query.message.answer(
+            ui.docs_form_example_text(),
+            parse_mode="HTML",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+    if action == "docs_text_ex":
+        session.card_mode = False
+        await query.message.answer(
+            ui.docs_text_example_text(),
+            parse_mode="HTML",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+    if action == "docs_fill_ex":
+        session.card_mode = False
+        await query.message.answer(
+            ui.docs_fill_example_text(),
+            parse_mode="HTML",
+            reply_markup=ui.docs_inline(),
+        )
+        return
     if action == "docs":
+        session.card_mode = False
         await query.message.answer(
             ui.docs_prompt_text(),
             parse_mode="HTML",
@@ -488,6 +542,15 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         return
     if action == "files":
         await _send_files_list(query.message, session)
+        return
+    if action == "gaps":
+        if not session.index.files:
+            await query.message.answer(
+                "Сначала пришлите документ.",
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        await _handle_gaps(query.message, session)
         return
     if action == "summary":
         if not session.index.files:
@@ -512,7 +575,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
                 chunks = session.index.preview_chunks()
             if not chunks:
                 refund_consume(query.from_user.id, charge, "summary")
-                await status.edit_text("В активных файлах нет текста.")
+                await status.edit_text("В загруженных файлах нет текста.")
                 return
             text = await asyncio.to_thread(summarize_document, chunks)
         except Exception as exc:
@@ -597,7 +660,7 @@ async def cmd_use(message: Message, command: CommandObject) -> None:
             None,
         )
     if match is None:
-        await message.answer("Файл не найден. Смотрите /files.")
+        await message.answer("Файл не найден. Список: /files")
         return
     session.active_path = match.path
     async with session.lock:
@@ -621,7 +684,7 @@ async def cmd_summary(message: Message) -> None:
             chunks = session.index.preview_chunks()
         if not chunks:
             _refund(message, charge, "summary")
-            await status.edit_text("В активных файлах нет текста для содержания.")
+            await status.edit_text("В загруженных файлах нет текста.")
             return
         text = await asyncio.to_thread(summarize_document, chunks)
     except Exception as exc:
@@ -644,7 +707,7 @@ async def on_photo(message: Message) -> None:
     if not session.card_mode and not looks_like_card(caption):
         await message.answer(
             "Чтобы собрать карточку, нажмите «Карточка» или /card — "
-            "затем описание либо фото товара."
+            "затем пришлите фото, видео или описание товара."
         )
         return
     charge = await _require_quota(message, "card")
@@ -658,6 +721,70 @@ async def on_photo(message: Message) -> None:
         await message.answer(_fit(f"Не удалось скачать фото: {exc}"))
         return
     await _make_card(message, session, caption, dest, charge)
+
+
+@router.message(F.video | F.animation | F.video_note)
+async def on_video_media(message: Message) -> None:
+    """Короткое видео товара → кадр для карточки (раньше видео просто игнорировалось)."""
+    session = _session_of(message.from_user)
+    if session is None:
+        return
+    caption = (message.caption or "").strip()
+    card_cmd = re.match(r"^/card(?:@\w+)?(?:\s+(.*))?$", caption, flags=re.IGNORECASE | re.DOTALL)
+    if card_cmd:
+        session.card_mode = True
+        caption = (card_cmd.group(1) or "").strip()
+    if not session.card_mode and not looks_like_card(caption):
+        await message.answer(
+            "Чтобы сделать карточку из видео, нажмите «Карточка» или /card — "
+            "затем пришлите короткое видео товара."
+        )
+        return
+
+    media = message.video or message.animation or message.video_note
+    if media is None:
+        return
+    size = int(getattr(media, "file_size", 0) or 0)
+    if size > MAX_FILE_BYTES:
+        await message.answer("Видео больше 20 МБ — Telegram не отдаст его боту.")
+        return
+
+    charge = await _require_quota(message, "card")
+    if charge is None:
+        return
+
+    user_dir = session.user_dir(DATA_DIR)
+    video_path = user_dir / "product_video.mp4"
+    frame_path = user_dir / "product.jpg"
+    status = await message.answer("Беру кадр из видео…")
+    try:
+        await message.bot.download(media, destination=video_path)
+        await asyncio.to_thread(extract_video_frame, video_path, frame_path)
+    except Exception as exc:
+        # Telegram почти всегда отдаёт превью — запасной вариант
+        thumb = getattr(media, "thumbnail", None)
+        if thumb is not None:
+            try:
+                await message.bot.download(thumb, destination=frame_path)
+            except Exception as exc2:
+                _refund(message, charge, "card")
+                try:
+                    await status.edit_text(_fit(f"Не удалось взять кадр из видео: {exc2}"))
+                except Exception:
+                    await message.answer(_fit(f"Не удалось взять кадр из видео: {exc2}"))
+                return
+        else:
+            _refund(message, charge, "card")
+            try:
+                await status.edit_text(_fit(f"Не удалось взять кадр из видео: {exc}"))
+            except Exception:
+                await message.answer(_fit(f"Не удалось взять кадр из видео: {exc}"))
+            return
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await _make_card(message, session, caption, frame_path, charge)
 
 
 @router.message(F.document)
@@ -676,8 +803,8 @@ async def on_document(message: Message) -> None:
             caption = (card_cmd.group(1) or "").strip()
         if not session.card_mode and not looks_like_card(caption):
             await message.answer(
-                "Это картинка. Для карточки нажмите «Карточка» "
-                "и пришлите фото товара или описание."
+                "Это изображение. Для карточки нажмите «Карточка», "
+                "затем пришлите фото/видео товара или описание."
             )
             return
         charge = await _require_quota(message, "card")
@@ -700,10 +827,10 @@ async def on_document(message: Message) -> None:
         return
     size = doc.file_size or 0
     if size > MAX_FILE_BYTES:
-        await message.answer("Файл больше 20 МБ — Telegram так не отдаст боту.")
+        await message.answer("Файл больше 20 МБ — Telegram не отдаст его боту.")
         return
     dest = session.user_dir(DATA_DIR) / name
-    status = await message.answer("Сохраняю и индексирую файл…")
+    status = await message.answer("Сохраняю файл…")
     try:
         await message.bot.download(doc, destination=dest)
         async with session.lock:
@@ -713,21 +840,27 @@ async def on_document(message: Message) -> None:
         return
     if n_chunks == 0:
         await status.edit_text(
-            f"Файл {name} сохранён, но текста из него не получилось. "
-            "PDF-скан без текстового слоя так не читается."
+            f"Файл {name} сохранён, но текста из него не достал. "
+            "Сканы PDF без текстового слоя так не читаются."
         )
         return
+    # Документ в чате — выходим из режима карточки, иначе следующий текст
+    # уйдёт в генерацию фото товара.
+    session.card_mode = False
     await status.edit_text(
         f"✅ <b>{escape(name)}</b> загружен\n"
         f"Фрагментов: {n_chunks}\n\n"
-        "Задайте вопрос по тексту или попросите правку (.docx — Pro).",
+        "Можно задать вопрос по тексту или попросить правку "
+        "(.docx).",
         parse_mode="HTML",
     )
     caption = (message.caption or "").strip()
     if caption and not caption.startswith("/"):
-        if looks_like_edit(caption):
+        if looks_like_edit(caption) or looks_like_fill_data(caption):
+            session.remember_doc_task("fill", caption, accumulate_facts=True)
             await _handle_edit(message, session, caption)
         else:
+            session.remember_doc_task("ask", caption)
             await _handle_question(message, session, caption)
 
 
@@ -808,18 +941,245 @@ async def on_text(message: Message) -> None:
     session = _session_of(message.from_user)
     if session is None:
         return
-    if session.card_mode or looks_like_card(text):
+
+    # Уже есть план правок (кнопки Применить/Отмена) — уточнение = новая правка,
+    # а не «создай бланк/текст».
+    if session.pending is not None:
+        session.card_mode = False
+        session.pending_clarify = None
+        low = text.lower()
+        if low in {"отмена", "cancel", "отменить"}:
+            session.pending = None
+            await message.answer("Правки отменены.")
+            return
+        if not await _require_files(message, session):
+            return
+        await _handle_edit(message, session, text)
+        return
+
+    has_files = bool(session.index.files)
+    decision = classify_document_intent(text, has_files=has_files)
+    intent = str(decision.get("intent") or "none")
+    edit_mode = str(decision.get("mode") or "")
+    fillish = looks_like_edit(text) or looks_like_fill_data(text)
+    # Продолжение заполнения, если в сессии уже копили данные
+    if (
+        has_files
+        and session.doc_task
+        and session.doc_task.kind == "fill"
+        and session.doc_task.facts
+        and any(
+            k in text.lower()
+            for k in ("добав", "эти данн", "вставь", "заполни", "фио", "подставь")
+        )
+    ):
+        fillish = True
+        intent = "edit"
+        edit_mode = "fill"
+
+    # Документная задача сильнее залипшего card_mode
+    if intent in {"edit", "ask", "check", "write_form", "write_text", "clarify"} or (
+        has_files and fillish
+    ):
+        session.card_mode = False
+
+        if intent == "check":
+            if not await _require_files(message, session):
+                return
+            await _handle_gaps(message, session)
+            return
+
+        if intent == "clarify" and not (has_files and fillish):
+            options = list(decision.get("options") or [])
+            question = str(decision.get("question") or "Уточните, что сделать?")
+            session.pending_clarify = PendingClarify(
+                prompt=text,
+                options=options,
+                question=question,
+            )
+            await message.answer(
+                ui.clarify_prompt_text(escape(question)),
+                parse_mode="HTML",
+                reply_markup=ui.clarify_intent_keyboard(options),
+            )
+            return
+
+        if intent in {"write_form", "write_text"} and not (has_files and fillish):
+            mode = "form" if intent == "write_form" else "text"
+            charge = await _require_quota(message, "write")
+            if charge is None:
+                return
+            session.remember_doc_task("write", text)
+            await _handle_write(message, session, text, charge, mode=mode)
+            return
+
+        if intent == "edit" or fillish:
+            if not await _require_files(message, session):
+                return
+            await _handle_edit(
+                message,
+                session,
+                text,
+                mode="fill" if edit_mode == "fill" or looks_like_fill_data(text) else "edit",
+            )
+            return
+
+        # ask / вопрос по файлу
+        if not await _require_files(message, session):
+            return
+        session.remember_doc_task("ask", text)
+        await _handle_question(message, session, text)
+        return
+
+    # Карточка: кнопка «Карточка» или явный товарный запрос
+    if session.card_mode or intent == "card" or looks_like_card(text):
+        if len(text) < 12:
+            await message.answer(
+                "Для карточки нужно описание товара (хотя бы пару слов) "
+                "или фото/видео.\n"
+                "Пример: «Нужно продать керамическую кружку 300 мл»."
+            )
+            return
         charge = await _require_quota(message, "card")
         if charge is None:
             return
         await _make_card(message, session, text, None, charge)
         return
-    if not await _require_files(message, session):
-        return
-    if looks_like_edit(text):
+
+    if intent == "edit" or looks_like_edit(text):
+        if not await _require_files(message, session):
+            return
         await _handle_edit(message, session, text)
         return
+
+    if not await _require_files(message, session):
+        return
     await _handle_question(message, session, text)
+
+
+@router.callback_query(F.data.startswith("docs:go:"))
+async def on_docs_clarify(query: CallbackQuery) -> None:
+    if query.from_user is None or not query.data or query.message is None:
+        await query.answer()
+        return
+    session = get_session(query.from_user.id)
+    action = query.data.split(":", 2)[-1]
+    await query.answer()
+
+    if action == "cancel":
+        session.pending_clarify = None
+        try:
+            await query.message.edit_text("Ок, отменил.")
+        except Exception:
+            await query.message.answer("Ок, отменил.")
+        return
+
+    if action == "need_file":
+        session.pending_clarify = None
+        await query.message.answer(
+            "Пришлите .docx в чат, затем повторите правку.\n"
+            "Пример: «Замени Иванова на Петрова».",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+
+    pending = session.pending_clarify
+    if pending is None or not pending.prompt:
+        await query.message.answer(
+            "Запрос устарел. Напишите задачу ещё раз.",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+
+    prompt = pending.prompt
+    session.pending_clarify = None
+
+    if action in {"write_form", "write_text"}:
+        mode = "form" if action == "write_form" else "text"
+        # quota через fake Message-like — используем query.message
+        user = query.from_user
+        ensure_user(user.id, user.language_code)
+        charge = consume(user.id, "write", user.language_code)
+        if not charge.ok:
+            await query.message.answer(
+                charge.message or "Лимит исчерпан. /pay",
+                reply_markup=upsell_keyboard(user.id, user.language_code),
+            )
+            return
+        try:
+            await query.message.edit_text(
+                "Принял: "
+                + ("бланк / титульный лист" if mode == "form" else "связный текст")
+            )
+        except Exception:
+            pass
+        await _handle_write(query.message, session, prompt, charge, mode=mode)
+        return
+
+    await query.message.answer("Не понял выбор. Напишите задачу ещё раз.")
+
+
+async def _handle_write(
+    message: Message,
+    session: UserSession,
+    prompt: str,
+    charge: ConsumeResult,
+    mode: str = "auto",
+) -> None:
+    mode = (mode or "auto").strip().lower()
+    status = await message.answer(ui.status_doc_write(mode if mode in {"form", "text"} else ""))
+    dest_dir = session.user_dir(DATA_DIR)
+    data: dict[str, Any] = {}
+    dest: Path | None = None
+    try:
+        data = await asyncio.to_thread(generate_document, prompt, mode)
+        used_mode = str(data.get("mode") or mode or "text")
+        fname = suggest_filename(
+            str(data.get("filename_stem") or data.get("title") or "document"),
+            str(data.get("doc_type") or "document"),
+        )
+        dest = dest_dir / fname
+        n = 1
+        while dest.exists():
+            dest = dest_dir / f"{Path(fname).stem}_{n}.docx"
+            n += 1
+        await asyncio.to_thread(
+            write_structured_docx,
+            dest,
+            title=str(data.get("title") or "Документ"),
+            sections=list(data.get("sections") or []),
+            doc_type=str(data.get("doc_type") or ""),
+            layout="form" if used_mode == "form" else "text",
+        )
+        async with session.lock:
+            await asyncio.to_thread(_ingest_path, session, dest)
+    except Exception as exc:
+        _refund(message, charge, "write")
+        await status.edit_text(_fit(f"Не удалось подготовить документ: {exc}"))
+        return
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    assert dest is not None
+    title = str(data.get("title") or dest.name)
+    dtype = str(data.get("doc_type") or "документ")
+    used_mode = str(data.get("mode") or mode or "text")
+    if used_mode == "form":
+        tip = (
+            "Это шаблон бланка (.docx) — откройте в Word.\n"
+            "Поля в квадратных скобках заполните сами. "
+            "Не официальный бланк ФНС, типовой макет для удобства."
+        )
+    else:
+        tip = (
+            "Это Word (.docx) — откройте в Word / LibreOffice / Google Документах.\n"
+            "Текст сгенерирован заново. Учебные работы лучше проверить антиплагиатом вуза."
+        )
+    await message.answer_document(
+        FSInputFile(dest),
+        caption=_fit(f"{title}\nТип: {dtype}\n{tip}"),
+    )
 
 
 async def _make_card(
@@ -829,42 +1189,93 @@ async def _make_card(
     photo_path: Path | None,
     charge: ConsumeResult,
 ) -> None:
+    has_photo = bool(photo_path and photo_path.exists())
+    if not has_photo and len((notes or "").strip()) < 12:
+        _refund(message, charge, "card")
+        await message.answer(
+            "Недостаточно данных для карточки. Пришлите фото/видео товара "
+            "или более подробное описание."
+        )
+        return
     status = await message.answer(ui.status_card_copy())
     image_bytes = None
-    if photo_path and photo_path.exists():
+    source_photo = photo_path if has_photo else None
+    if has_photo and photo_path is not None:
         image_bytes = photo_path.read_bytes()
         if len(image_bytes) > MAX_FILE_BYTES:
             _refund(message, charge, "card")
-            await status.edit_text("Фото больше 20 МБ.")
+            await status.edit_text("Фото больше 20 МБ — Telegram не отдаст его боту.")
             return
     paths: list[Path] = []
+    data: dict[str, Any] = {}
+    dest_dir = session.user_dir(DATA_DIR)
+    variant = peek_variant(dest_dir)
+    style_title = VARIANT_TITLES.get(variant, variant)
     try:
         data = await asyncio.to_thread(make_product_card, notes or "", image_bytes)
-        dest_dir = session.user_dir(DATA_DIR)
-        if photo_path is None or not photo_path.exists():
-            await status.edit_text(ui.status_card_photo())
+        scene = scene_for_product(
+            str(data.get("label") or ""),
+            str(data.get("title") or ""),
+            str(data.get("scene") or ""),
+        )
+        await status.edit_text(
+            ui.status_card_photo_lifestyle()
+            if variant == "lifestyle"
+            else ui.status_card_photo()
+        )
+        try:
             gen_bytes = await asyncio.to_thread(
                 generate_product_photo,
                 notes or str(data.get("title") or "product"),
                 str(data.get("title") or ""),
                 str(data.get("label") or ""),
                 str(data.get("image_prompt") or ""),
+                image_bytes,
+                variant if variant in VARIANTS else "catalog",
+                scene,
             )
-            photo_path = dest_dir / "product_gen.png"
-            photo_path.write_bytes(gen_bytes)
+            raw_studio = dest_dir / "product_studio_raw.png"
+            raw_studio.write_bytes(gen_bytes)
+            studio_path = dest_dir / "product_studio.png"
+            photo_path = await asyncio.to_thread(
+                prepare_studio_product,
+                raw_studio,
+                studio_path,
+                force_rembg=False,
+                skip_rembg=(variant == "lifestyle"),
+            )
+        except Exception as gen_exc:
+            if source_photo is not None and source_photo.exists():
+                log.warning("Studio gen failed (%s), fallback rembg cutout", gen_exc)
+                await status.edit_text("Студия недоступна — вырезаю товар с вашего фото…")
+                fallback = dest_dir / "product_studio.png"
+                photo_path = await asyncio.to_thread(
+                    prepare_fallback_cutout, source_photo, fallback
+                )
+                # lifestyle без сцены → каталожный layout
+                if variant == "lifestyle":
+                    variant = "catalog"
+                    style_title = VARIANT_TITLES.get(variant, variant)
+            else:
+                raise
         await status.edit_text(ui.status_card_layout())
+        if photo_path is None or not Path(photo_path).exists():
+            raise RuntimeError("Нет готового фото товара для слайдов")
         stem = "card"
         n = 1
         while (dest_dir / f"{stem}_hero.png").exists():
             stem = f"card_{n}"
             n += 1
         paths = await asyncio.to_thread(
-            render_product_card_pack, dest_dir, data, photo_path, stem
+            render_product_card_pack, dest_dir, data, photo_path, stem, variant
         )
+        if not paths:
+            raise RuntimeError("Рендер не вернул слайды")
     except Exception as exc:
         _refund(message, charge, "card")
         await status.edit_text(_fit(f"Не удалось собрать карточку: {exc}"))
         return
+    bump_card_count(dest_dir)
     session.card_mode = False
     try:
         await status.delete()
@@ -874,7 +1285,11 @@ async def _make_card(
     media = [
         InputMediaPhoto(
             media=FSInputFile(paths[0]),
-            caption=_fit(f"{title}\nСлайды 1/3 — обложка · 2/3 — детали · 3/3 — выгоды", 900),
+            caption=_fit(
+                f"{title}\nСтиль: «{style_title}»\n"
+                f"1/3 обложка · 2/3 детали · 3/3 выгоды",
+                900,
+            ),
         )
     ]
     for path in paths[1:]:
@@ -887,13 +1302,20 @@ async def _make_card(
         parts.append("Ключевые запросы:\n" + str(data["keywords"]))
     if parts:
         await _reply_long(message, "\n\n".join(parts))
+    next_style = VARIANT_TITLES.get(peek_variant(dest_dir), "")
     await message.answer(
-        "Готово: 3 слайда для маркетплейса. Можно сделать ещё или открыть меню.",
+        f"Готово: 3 слайда (стиль «{style_title}»).\n"
+        f"Следующая карточка будет в стиле «{next_style}».\n"
+        "Можно сделать ещё или вернуться в меню.",
         reply_markup=ui.card_inline(),
     )
 
 
 async def _handle_question(message: Message, session: UserSession, text: str) -> None:
+    # Если это всё же заполнение — не ищем «Чикасова в файле»
+    if looks_like_fill_data(text) or looks_like_edit(text):
+        await _handle_edit(message, session, text, mode="fill")
+        return
     charge = await _require_quota(message, "ask")
     if charge is None:
         return
@@ -903,7 +1325,7 @@ async def _handle_question(message: Message, session: UserSession, text: str) ->
             hits = await asyncio.to_thread(session.index.search, text)
         if not hits:
             _refund(message, charge, "ask")
-            await status.edit_text("По этому запросу фрагментов не нашлось.")
+            await status.edit_text("По этому запросу в документах ничего нет.")
             return
         data = await asyncio.to_thread(ask_document, text, hits)
     except Exception as exc:
@@ -915,44 +1337,109 @@ async def _handle_question(message: Message, session: UserSession, text: str) ->
     await _finish_status(status, message, answer)
 
 
-async def _handle_edit(message: Message, session: UserSession, text: str) -> None:
+async def _handle_gaps(message: Message, session: UserSession) -> None:
+    charge = await _require_quota(message, "ask")
+    if charge is None:
+        return
+    status = await message.answer("Смотрю, какие поля ещё пустые…")
+    try:
+        async with session.lock:
+            chunks = session.index.preview_chunks(20)
+        if not chunks:
+            _refund(message, charge, "ask")
+            await status.edit_text("В загруженных файлах нет текста.")
+            return
+        text = await asyncio.to_thread(check_document_gaps, chunks)
+    except Exception as exc:
+        _refund(message, charge, "ask")
+        await status.edit_text(_fit(f"Не удалось проверить поля: {exc}"))
+        return
+    session.remember_doc_task("check", "что не заполнено")
+    await _finish_status(status, message, text)
+
+
+async def _handle_edit(
+    message: Message,
+    session: UserSession,
+    text: str,
+    mode: str = "auto",
+) -> None:
     active = session.active_path
     if active is None:
-        await message.answer("Нет активного файла. Отправьте документ или выберите его через /use.")
+        await message.answer(
+            "Нет активного файла. Отправьте документ или выберите его через /use."
+        )
         return
     if active.suffix.lower() != ".docx":
         await message.answer(
-            "Править с сохранением файла можно только .docx. "
-            "Задайте вопрос по тексту или отправьте Word."
+            "Править с сохранением можно только .docx.\n"
+            "Задайте вопрос по тексту или пришлите Word-файл."
         )
         return
+
+    fill_mode = mode == "fill" or looks_like_fill_data(text)
+    if fill_mode:
+        session.remember_doc_task("fill", text, accumulate_facts=True)
+        instruction = session.fill_instruction(text)
+        status_msg = "Готовлю заполнение бланка…"
+    else:
+        session.remember_doc_task("edit", text)
+        instruction = text
+        status_msg = "Готовлю план правок…"
+
     charge = await _require_quota(message, "edit")
     if charge is None:
         return
-    status = await message.answer("Готовлю план правок…")
+    status = await message.answer(status_msg)
     try:
         async with session.lock:
-            hits = await asyncio.to_thread(session.index.search, text)
-            if not hits:
-                hits = [Hit(chunk=c, score=1.0) for c in session.index.preview_chunks(12)]
+            # Для заполнения лучше широкий контекст бланка, не только поиск по ФИО
+            if fill_mode:
+                hits = [Hit(chunk=c, score=1.0) for c in session.index.preview_chunks(16)]
+                more = await asyncio.to_thread(session.index.search, instruction)
+                seen = {h.chunk.text[:80] for h in hits}
+                for h in more:
+                    key = h.chunk.text[:80]
+                    if key not in seen:
+                        hits.append(h)
+                        seen.add(key)
+            else:
+                hits = await asyncio.to_thread(session.index.search, instruction)
+                if not hits:
+                    hits = [
+                        Hit(chunk=c, score=1.0)
+                        for c in session.index.preview_chunks(12)
+                    ]
         if not hits:
             _refund(message, charge, "edit")
             await status.edit_text("В файле нет текста для правок.")
             return
         data = await asyncio.to_thread(
             plan_edits,
-            text,
+            instruction,
             hits,
             active.name,
             True,
+            "fill" if fill_mode else "edit",
         )
     except Exception as exc:
         _refund(message, charge, "edit")
         await status.edit_text(_fit(f"Ошибка модели: {exc}"))
         return
     kind = data.get("kind") or "none"
+    patches = list(data.get("patches") or [])
+    if kind == "patch":
+        patches = filter_valid_patches(active, patches)
+        data["patches"] = patches
+        if not patches:
+            kind = "none"
+            data["summary"] = (
+                str(data.get("summary") or "")
+                + " Точные фрагменты для безопасной замены в файле не нашлись — "
+                "ничего не меняю, чтобы не испортить документ."
+            ).strip()
     if kind == "none" or (
-        kind == "patch" and not data.get("patches")
+        kind == "patch" and not patches
     ) or (
         kind == "rewrite" and not str(data.get("rewrite_text") or "").strip()
     ):
@@ -963,7 +1450,7 @@ async def _handle_edit(message: Message, session: UserSession, text: str) -> Non
     pending = PendingEdit(
         kind=kind,
         source=active,
-        patches=list(data.get("patches") or []),
+        patches=patches,
         rewrite_text=str(data.get("rewrite_text") or ""),
         summary=str(data.get("summary") or ""),
     )

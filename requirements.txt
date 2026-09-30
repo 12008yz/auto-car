@@ -13,3 +13,5 @@ pypdf
 openpyxl
 python-pptx
 pillow
+rembg
+onnxruntime

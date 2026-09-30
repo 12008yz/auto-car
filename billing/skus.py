@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-Action = Literal["ask", "summary", "edit", "card"]
+Action = Literal["ask", "summary", "edit", "card", "write"]
 SkuId = Literal["pro_month", "credits_20", "credits_50"]
 Rail = Literal["unitpay", "stars"]
 
@@ -54,14 +54,16 @@ ACTION_COST: dict[Action, int] = {
     "summary": 2,
     "edit": 3,
     "card": 2,
+    "write": 3,
 }
 
-# Free daily caps (edit blocked on free)
+# Free daily caps (при BILLING_OPEN_ACCESS лимиты не применяются)
 FREE_DAILY: dict[Action, int] = {
     "ask": 100,
     "summary": 100,
-    "edit": 0,
+    "edit": 50,
     "card": 100,
+    "write": 15,
 }
 
 

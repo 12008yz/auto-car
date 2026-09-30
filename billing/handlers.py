@@ -104,15 +104,15 @@ async def on_rail_switch(query: CallbackQuery) -> None:
     apply_rail_choice(query.from_user.id, rail, lang)  # type: ignore[arg-type]
     ru = _lang_ru(lang, rail)  # type: ignore[arg-type]
     text = (
-        "Рельс: UnitPay (₽). Выберите тариф:"
+        "Способ оплаты: UnitPay (₽). Выберите тариф:"
         if rail == "unitpay" and ru
         else (
-            "Rail: Stars. Choose a plan:"
+            "Payment method: Stars. Choose a plan:"
             if rail == "stars" and not ru
             else (
-                "Рельс: Stars. Выберите тариф:"
+                "Способ оплаты: Stars. Выберите тариф:"
                 if rail == "stars"
-                else "Rail: UnitPay (RUB). Choose a plan:"
+                else "Payment method: UnitPay (RUB). Choose a plan:"
             )
         )
     )

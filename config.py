@@ -44,6 +44,13 @@ ALLOWED_SUFFIXES = {
 BILLING_DB_PATH = Path(
     os.getenv("BILLING_DB_PATH", str(ROOT / "data" / "billing.sqlite3"))
 )
+# Пока открытый доступ: без Pro и без списания лимитов (вернуть False перед продакшеном)
+BILLING_OPEN_ACCESS = os.getenv("BILLING_OPEN_ACCESS", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 BILLING_HTTP_HOST = os.getenv("BILLING_HTTP_HOST", "0.0.0.0").strip()
 BILLING_HTTP_PORT = int(os.getenv("BILLING_HTTP_PORT", "8088"))
 BILLING_PUBLIC_BASE_URL = os.getenv("BILLING_PUBLIC_BASE_URL", "").strip().rstrip("/")

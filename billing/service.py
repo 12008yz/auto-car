@@ -9,6 +9,7 @@ from typing import Any
 
 from billing.db import connect, init_db
 from billing.skus import ACTION_COST, FREE_DAILY, Action, Rail, get_sku
+from config import BILLING_OPEN_ACCESS
 
 _lock = threading.RLock()
 _initialized = False
@@ -74,9 +75,11 @@ class BalanceInfo:
     daily_ask: int
     daily_summary: int
     daily_card: int
+    daily_write: int
     daily_ask_limit: int
     daily_summary_limit: int
     daily_card_limit: int
+    daily_write_limit: int
     is_pro: bool
 
 
@@ -97,7 +100,7 @@ def ensure_user(telegram_id: int, language_code: str | None = None) -> Rail:
             )
             conn.execute(
                 "INSERT INTO wallets (telegram_id, credits_balance, daily_ask, daily_summary, "
-                "daily_card, daily_date) VALUES (?, 0, 0, 0, 0, ?)",
+                "daily_card, daily_write, daily_date) VALUES (?, 0, 0, 0, 0, 0, ?)",
                 (telegram_id, today),
             )
             conn.execute(
@@ -143,7 +146,7 @@ def _reset_daily_if_needed(conn, telegram_id: int) -> None:
     if row["daily_date"] != today:
         conn.execute(
             "UPDATE wallets SET daily_ask = 0, daily_summary = 0, daily_card = 0, "
-            "daily_date = ? WHERE telegram_id = ?",
+            "daily_write = 0, daily_date = ? WHERE telegram_id = ?",
             (today, telegram_id),
         )
 
@@ -173,7 +176,7 @@ def get_balance(telegram_id: int, language_code: str | None = None) -> BalanceIn
             (telegram_id,),
         ).fetchone()
         wallet = conn.execute(
-            "SELECT credits_balance, daily_ask, daily_summary, daily_card "
+            "SELECT credits_balance, daily_ask, daily_summary, daily_card, daily_write "
             "FROM wallets WHERE telegram_id = ?",
             (telegram_id,),
         ).fetchone()
@@ -191,27 +194,25 @@ def get_balance(telegram_id: int, language_code: str | None = None) -> BalanceIn
             daily_ask=int(wallet["daily_ask"] if wallet else 0),
             daily_summary=int(wallet["daily_summary"] if wallet else 0),
             daily_card=int(wallet["daily_card"] if wallet else 0),
+            daily_write=int(wallet["daily_write"] if wallet else 0),
             daily_ask_limit=FREE_DAILY["ask"],
             daily_summary_limit=FREE_DAILY["summary"],
             daily_card_limit=FREE_DAILY["card"],
+            daily_write_limit=FREE_DAILY["write"],
             is_pro=is_pro,
         )
 
 
 def consume(telegram_id: int, action: Action, language_code: str | None = None) -> ConsumeResult:
     ensure_user(telegram_id, language_code)
+    if BILLING_OPEN_ACCESS:
+        # Временно: всё бесплатно, без Pro и лимитов
+        return ConsumeResult(ok=True, charged="open", amount=0)
+
     cost = ACTION_COST[action]
     with _lock, connect() as conn:
         _reset_daily_if_needed(conn, telegram_id)
         is_pro = _is_pro(conn, telegram_id)
-
-        if action == "edit" and not is_pro:
-            conn.commit()
-            return ConsumeResult(
-                ok=False,
-                reason="pro_required",
-                message="Правки Word доступны на тарифе Pro. Оформите подписку: /pay",
-            )
 
         wallet = conn.execute(
             "SELECT credits_balance FROM wallets WHERE telegram_id = ?",
@@ -219,7 +220,7 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
         ).fetchone()
         balance = int(wallet["credits_balance"] if wallet else 0)
 
-        # Bought credits work for Free and Pro (edit still requires Pro above).
+        # Bought credits work for Free and Pro
         if balance >= cost:
             conn.execute(
                 "UPDATE wallets SET credits_balance = credits_balance - ? WHERE telegram_id = ?",
@@ -246,12 +247,14 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
             return ConsumeResult(
                 ok=False,
                 reason="pro_required",
-                message="Эта функция доступна на Pro. Оформите подписку: /pay",
+                message="Эта функция временно недоступна. /pay",
             )
         col = {
             "ask": "daily_ask",
             "summary": "daily_summary",
             "card": "daily_card",
+            "write": "daily_write",
+            "edit": "daily_write",  # общий дневной счётчик, пока нет отдельной колонки
         }[action]
         daily = conn.execute(
             f"SELECT {col} AS used FROM wallets WHERE telegram_id = ?",
@@ -291,11 +294,12 @@ def refund_consume(
                 "UPDATE wallets SET credits_balance = credits_balance + ? WHERE telegram_id = ?",
                 (result.amount, telegram_id),
             )
-        elif result.charged == "daily" and action in {"ask", "summary", "card"}:
+        elif result.charged == "daily" and action in {"ask", "summary", "card", "write"}:
             col = {
                 "ask": "daily_ask",
                 "summary": "daily_summary",
                 "card": "daily_card",
+                "write": "daily_write",
             }[action]
             conn.execute(
                 f"UPDATE wallets SET {col} = CASE WHEN {col} > 0 THEN {col} - 1 ELSE 0 END "

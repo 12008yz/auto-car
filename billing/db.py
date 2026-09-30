@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     daily_ask INTEGER NOT NULL DEFAULT 0,
     daily_summary INTEGER NOT NULL DEFAULT 0,
     daily_card INTEGER NOT NULL DEFAULT 0,
+    daily_write INTEGER NOT NULL DEFAULT 0,
     daily_date TEXT NOT NULL
 );
 
@@ -69,4 +70,10 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        # Миграция для уже существующих БД
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(wallets)")}
+        if "daily_write" not in cols:
+            conn.execute(
+                "ALTER TABLE wallets ADD COLUMN daily_write INTEGER NOT NULL DEFAULT 0"
+            )
         conn.commit()

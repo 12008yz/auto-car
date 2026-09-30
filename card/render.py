@@ -4,7 +4,7 @@ import colorsys
 import math
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 CARD_W = 1080
 CARD_H = 1440
@@ -209,12 +209,13 @@ def _paste_shadow(canvas: Image.Image, product: Image.Image, xy: tuple[int, int]
     x, y = xy
     if product.mode != "RGBA":
         product = product.convert("RGBA")
-    pad = 56
+    pad = 72
     shadow = Image.new("RGBA", (product.width + pad * 2, product.height + pad * 2), (0, 0, 0, 0))
-    layer = Image.new("RGBA", product.size, (0, 0, 0, 55))
-    layer.putalpha(product.split()[-1].point(lambda a: min(55, a)))
-    shadow.paste(layer, (pad + 4, pad + 18), layer)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(26))
+    layer = Image.new("RGBA", product.size, (0, 0, 0, 70))
+    layer.putalpha(product.split()[-1].point(lambda a: min(70, a)))
+    # мягкая «контактная» тень чуть ниже товара
+    shadow.paste(layer, (pad + 2, pad + 28), layer)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(32))
     _alpha_paste(canvas, shadow, (x - pad, y - pad))
     _alpha_paste(canvas, product, (x, y))
 
@@ -303,7 +304,7 @@ def _draw_centered_lines(
 def _prepare_data(data: dict) -> dict:
     # Заголовок не режем многоточием — влезает за счёт переноса/уменьшения шрифта
     title = _clip_words(str(data.get("title") or "Карточка товара"), 64, ellipsis=False)
-    subtitle = _clip_words(str(data.get("subtitle") or ""), 56, ellipsis=False)
+    subtitle = _clip_words(str(data.get("subtitle") or ""), 40, ellipsis=False)
     label = str(data.get("label") or "").strip().upper()[:16]
     hook = str(data.get("hook") or subtitle or (data.get("bullets") or [""])[0] or "").strip()
     origin = str(data.get("origin") or "").strip()
@@ -391,38 +392,80 @@ def _mix_hex(a: str, b: str, t: float) -> str:
     return f"#{r:02X}{g:02X}{b_:02X}"
 
 
-def _chiba_background(palette: tuple[str, str, str, str, str]) -> Image.Image:
-    """Мягкий градиент + блики в духе WB-инфографики."""
+def _studio_background(palette: tuple[str, str, str, str, str]) -> Image.Image:
+    """Чистый каталожный фон: почти белый + мягкий tint акцента (как у топ-карточек WB)."""
     soft, _dark, white, accent, deep = palette
-    top = _mix_hex(soft, white, 0.35)
-    bottom = _mix_hex(deep, accent, 0.22)
+    top = _mix_hex(white, soft, 0.22)
+    bottom = _mix_hex(soft, deep, 0.28)
     canvas = _gradient((CARD_W, CARD_H), top, bottom)
     overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
     d = ImageDraw.Draw(overlay)
-    seed = sum(ord(c) for c in accent) * 17 + 91
-    # мягкие боке-круги
-    for i in range(18):
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        x = seed % CARD_W
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        y = seed % CARD_H
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        r = 40 + seed % 120
-        col = _hex_rgb(accent if i % 3 else white)
-        d.ellipse((x - r, y - r, x + r, y + r), fill=(*col, 28 if i % 3 else 36))
-    # искры / звёздочки
-    for i in range(28):
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        x = 40 + seed % (CARD_W - 80)
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        y = 40 + seed % (CARD_H - 80)
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        s = 3 + seed % 7
-        d.ellipse((x - s, y - s, x + s, y + s), fill=(255, 255, 255, 140))
-        d.line((x - s * 2, y, x + s * 2, y), fill=(255, 255, 255, 90), width=1)
-        d.line((x, y - s * 2, x, y + s * 2), fill=(255, 255, 255, 90), width=1)
-    canvas = Image.alpha_composite(canvas, overlay)
-    return canvas
+    ar, ag, ab = _hex_rgb(accent)
+    d.ellipse((-180, CARD_H - 420, 420, CARD_H + 180), fill=(ar, ag, ab, 28))
+    d.ellipse((CARD_W - 380, -160, CARD_W + 200, 380), fill=(ar, ag, ab, 18))
+    return Image.alpha_composite(canvas, overlay)
+
+
+def _chiba_background(palette: tuple[str, str, str, str, str]) -> Image.Image:
+    """Совместимость: тот же студийный фон."""
+    return _studio_background(palette)
+
+
+def _draw_product_pedestal(
+    canvas: Image.Image,
+    center: tuple[int, int],
+    width: int,
+    accent: str,
+) -> None:
+    """Мягкая эллиптическая подложка под товар."""
+    cx, cy = center
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    rw, rh = max(140, width // 2), max(40, width // 9)
+    y = cy + int(width * 0.38)
+    d.ellipse((cx - rw, y - rh // 2, cx + rw, y + rh), fill=(0, 0, 0, 36))
+    ar, ag, ab = _hex_rgb(accent)
+    d.ellipse(
+        (cx - int(rw * 0.82), y - int(rh * 0.3), cx + int(rw * 0.82), y + int(rh * 0.65)),
+        fill=(ar, ag, ab, 48),
+    )
+    canvas.alpha_composite(overlay.filter(ImageFilter.GaussianBlur(20)))
+
+
+def _safe_margin() -> int:
+    """Отступ от краёв: WB перекрывает углы бейджами UI."""
+    return 72
+
+
+def _feature_chip(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    fill: str,
+    text_color: str,
+    font,
+    *,
+    max_w: int = 360,
+) -> tuple[int, int]:
+    """Короткая плашка УТП (1–2 строки). Возвращает (w, h)."""
+    x, y = xy
+    lines = _wrap(draw, text, font, max_w - 40, max_lines=2) or [text[:18]]
+    pad_x, pad_y, gap = 22, 14, 4
+    heights = []
+    for ln in lines:
+        b = draw.textbbox((0, 0), ln, font=font)
+        heights.append(b[3] - b[1])
+    tw = int(max(_text_w(draw, ln, font) for ln in lines))
+    th = sum(heights) + gap * max(0, len(lines) - 1)
+    w = tw + pad_x * 2
+    h = th + pad_y * 2
+    draw.rounded_rectangle((x, y, x + w, y + h), radius=max(18, h // 2), fill=fill)
+    ty = y + pad_y
+    for i, ln in enumerate(lines):
+        b = draw.textbbox((0, 0), ln, font=font)
+        draw.text((x + pad_x, ty - b[1]), ln, font=font, fill=text_color)
+        ty += heights[i] + gap
+    return w, h
 
 
 def _text_outline(
@@ -461,7 +504,6 @@ def _curve_points(
     ex, ey = end
     mx = (sx + ex) / 2
     my = (sy + ey) / 2
-    # перпендикуляр для дуги
     dx, dy = ex - sx, ey - sy
     nx, ny = -dy, dx
     norm = (nx * nx + ny * ny) ** 0.5 or 1.0
@@ -520,130 +562,135 @@ def _dashed_circle(
         )
 
 
+def _callout_pill(
+    draw: ImageDraw.ImageDraw,
+    text_lines: list[str],
+    font,
+    anchor_xy: tuple[float, float],
+    align: str,
+    fill: str,
+    text_color: str,
+    border: str,
+) -> tuple[float, float, float, float]:
+    pad_x, pad_y, gap = 22, 14, 4
+    widths = [int(_text_w(draw, ln, font)) for ln in text_lines] or [40]
+    heights = []
+    for ln in text_lines:
+        b = draw.textbbox((0, 0), ln, font=font)
+        heights.append(b[3] - b[1])
+    tw = max(widths)
+    th = sum(heights) + gap * max(0, len(text_lines) - 1)
+    bw, bh = tw + pad_x * 2, th + pad_y * 2
+    ax, ay = anchor_xy
+    if align == "left":
+        x1, x2 = ax, ax + bw
+    else:
+        x1, x2 = ax - bw, ax
+    y1, y2 = ay - bh / 2, ay + bh / 2
+    draw.rounded_rectangle((x1, y1, x2, y2), radius=18, fill=fill, outline=border, width=3)
+    y = y1 + pad_y
+    for i, ln in enumerate(text_lines):
+        b = draw.textbbox((0, 0), ln, font=font)
+        draw.text((x1 + pad_x, y - b[1]), ln, font=font, fill=text_color)
+        y += heights[i] + gap
+    return x1, y1, x2, y2
+
+
+def _hero_headline(data: dict) -> tuple[str, str]:
+    raw_title = (data.get("title") or "").strip()
+    label = (data.get("label") or "").strip()
+    subtitle = (data.get("subtitle") or "").strip()
+    if raw_title.lower() in {"карточка товара", "product card", "товар"}:
+        return (label or subtitle or "ТОВАР").upper(), ""
+    if label:
+        line1 = label.upper()
+        if subtitle:
+            return line1, subtitle
+        if raw_title.upper().startswith(label.upper()):
+            return line1, raw_title[len(label) :].strip(" -—,.")
+        return line1, raw_title
+    words = raw_title.split()
+    if len(words) > 3:
+        mid = max(2, len(words) // 2)
+        return " ".join(words[:mid]).upper(), " ".join(words[mid:])
+    return raw_title.upper(), subtitle
+
+
 def _slide_hero(data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]) -> Image.Image:
-    """Обложка в стиле WB-инфографики «Чиба»: title, товар, выноски, бейджи."""
-    _soft, dark, white, accent, _deep = palette
-    canvas = _chiba_background(palette)
+    """
+    Обложка как у топ-карточек WB:
+    товар ~70% кадра, УТП-плашка, до 2 коротких чипов, safe-margin под UI WB.
+    """
+    soft, dark, white, accent, _deep = palette
+    canvas = _studio_background(palette)
     draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
 
-    # Заголовок по центру сверху — крупный с обводкой
-    line1 = (data["label"] or data["title"]).strip().upper()
-    line2 = ""
-    if data["label"] and data["subtitle"]:
-        line2 = data["subtitle"].strip()
-    elif data["label"] and data["title"] and data["title"].upper() != data["label"]:
-        t = data["title"]
-        if t.upper().startswith(data["label"]):
-            line2 = t[len(data["label"]) :].strip(" -—,.")
-        else:
-            line2 = t
-    elif not data["label"]:
-        words = data["title"].split()
-        if len(words) > 3:
-            mid = max(2, len(words) // 2)
-            line1 = " ".join(words[:mid]).upper()
-            line2 = " ".join(words[mid:])
-        else:
-            line1 = data["title"].upper()
-
-    title_fill = _mix_hex(accent, "#F5D76E", 0.35)
-    outline = _mix_hex(accent, "#7A1020", 0.55)
-    y = 70
+    line1, line2 = _hero_headline(data)
+    y = float(m - 8)
     for idx, line in enumerate([line1, line2] if line2 else [line1]):
         if not line:
             continue
-        max_w = CARD_W - 100
-        size = 72 if idx == 0 else 54
+        max_w = CARD_W - m * 2
+        size = 56 if idx == 0 else 34
         font = _font(size, "bold")
-        while size >= 34 and _text_w(draw, line, font) > max_w:
+        while size >= 28 and _text_w(draw, line, font) > max_w:
             size -= 2
             font = _font(size, "bold")
-        fill = title_fill if idx == 0 else _mix_hex("#F5D76E", accent, 0.25)
-        _text_outline(
-            draw,
-            (CARD_W / 2, y + size / 2),
-            line,
-            font,
-            fill=fill,
-            outline=outline,
-            width=5 if idx == 0 else 3,
-            anchor="mm",
-        )
-        y += size + 12
+        fill = dark if idx == 0 else _mix_hex(dark, accent, 0.4)
+        draw.text((CARD_W / 2, y + size / 2), line, font=font, fill=fill, anchor="mm")
+        y += size + (8 if idx == 0 else 6)
 
-    # Товар по центру
-    photo_top = max(y + 20, 260)
-    photo_bottom = CARD_H - 160
+    hook = (data.get("hook") or "").strip()
+    if hook:
+        hf = _font(24, "semi")
+        hook_text = hook[:28]
+        pill_w = int(_text_w(draw, hook_text, hf)) + 44
+        _pill(draw, ((CARD_W - pill_w) // 2, int(y + 6)), hook_text, accent, white, hf)
+        y += 58
+
+    photo_top = int(max(y + 12, 200))
+    photo_bottom = CARD_H - m - 20
     if product is not None:
-        cx, cy = _place_in_box(canvas, product, (120, photo_top, CARD_W - 120, photo_bottom))
+        box_cx = CARD_W // 2
+        box_cy = (photo_top + photo_bottom) // 2 + 30
+        _draw_product_pedestal(canvas, (box_cx, box_cy), 680, accent)
+        cx, cy = _place_in_box(
+            canvas,
+            product,
+            (m + 20, photo_top, CARD_W - m - 20, photo_bottom),
+        )
     else:
-        draw.rounded_rectangle((180, photo_top + 60, 900, photo_bottom - 60), radius=36, fill=white)
+        draw.rounded_rectangle(
+            (180, photo_top + 80, 900, photo_bottom - 80), radius=36, fill=white
+        )
         cx, cy = CARD_W // 2, (photo_top + photo_bottom) // 2
 
-    # Бейдж размера — пунктирный круг слева сверху у товара
     size_txt = (data.get("size") or "").strip()
     if size_txt:
-        bx, by, br = 150, photo_top + 90, 78
+        bx, by, br = m + 70, photo_top + 80, 68
         _dashed_circle(draw, (bx, by), br, white, width=5, dashes=32)
         _dashed_circle(draw, (bx, by), br - 3, accent, width=2, dashes=32)
-        sf = _font(34, "bold")
+        sf = _font(28, "bold")
         _text_outline(draw, (bx, by), size_txt, sf, fill=dark, outline=white, width=3, anchor="mm")
 
-    # Выноски со стрелками (до 3)
-    callouts = [c for c in (data.get("callouts") or []) if c][:3]
-    callout_font = _font(28, "bold")
-    # позиции текста и якоря на товаре
-    layouts = [
-        # left mid
-        {"text_xy": (70, cy - 40), "anchor": (cx - 120, cy - 20), "align": "left", "bend": 0.28},
-        # right mid
-        {"text_xy": (CARD_W - 70, cy - 10), "anchor": (cx + 130, cy + 10), "align": "right", "bend": -0.26},
-        # right lower
-        {"text_xy": (CARD_W - 70, cy + 220), "anchor": (cx + 80, cy + 160), "align": "right", "bend": -0.18},
-    ]
-    for i, text in enumerate(callouts):
-        lay = layouts[i]
-        tx, ty = lay["text_xy"]
-        ax, ay = lay["anchor"]
-        wrapped = _wrap(draw, text.upper() if len(text) < 22 else text, callout_font, 320, max_lines=2)
-        if not wrapped:
-            continue
-        # блок текста
-        line_h = 34
-        block_h = line_h * len(wrapped)
-        max_ln_w = int(max(_text_w(draw, ln, callout_font) for ln in wrapped))
-        if lay["align"] == "left":
-            x0 = tx
-            for j, ln in enumerate(wrapped):
-                _text_outline(
-                    draw,
-                    (x0, ty + j * line_h),
-                    ln,
-                    callout_font,
-                    fill=dark,
-                    outline=white,
-                    width=3,
-                    anchor="lm",
-                )
-            text_end = (x0 + max_ln_w + 8, ty)
-        else:
-            for j, ln in enumerate(wrapped):
-                _text_outline(
-                    draw,
-                    (tx, ty + j * line_h),
-                    ln,
-                    callout_font,
-                    fill=dark,
-                    outline=white,
-                    width=3,
-                    anchor="rm",
-                )
-            text_end = (tx - max_ln_w - 8, ty)
-        # стрелка от текста к товару
-        start = (text_end[0], ty + block_h / 2 - line_h / 2)
-        _draw_curve_arrow(draw, start, (ax, ay), dark, width=4, bend=lay["bend"])
+    chips = [c for c in (data.get("callouts") or []) if c][:2]
+    chip_font = _font(24, "semi")
+    if chips:
+        _feature_chip(draw, (m, int(cy - 40)), chips[0], white, dark, chip_font, max_w=300)
+    if len(chips) > 1:
+        lines = _wrap(draw, chips[1], chip_font, 260, max_lines=2) or [chips[1]]
+        tw = int(max(_text_w(draw, ln, chip_font) for ln in lines)) + 44
+        _feature_chip(
+            draw,
+            (CARD_W - m - tw, int(cy + 120)),
+            chips[1],
+            white,
+            dark,
+            chip_font,
+            max_w=300,
+        )
 
-    # Origin справа внизу
     origin = (data.get("origin") or "").strip()
     if origin:
         short = origin
@@ -652,7 +699,6 @@ def _slide_hero(data: dict, product: Image.Image | None, palette: tuple[str, str
                 short = short[len(prefix) :]
                 break
         short = short.strip()
-        # Именительный падеж для частых стран
         _country = {
             "беларуси": "БЕЛАРУСЬ",
             "беларусь": "БЕЛАРУСЬ",
@@ -664,61 +710,68 @@ def _slide_hero(data: dict, product: Image.Image | None, palette: tuple[str, str
             "турция": "ТУРЦИЯ",
         }
         short = _country.get(short.lower(), short.upper())
-        ox, oy = CARD_W - 64, CARD_H - 90
-        draw.ellipse((ox - 210, oy - 28, ox - 154, oy + 28), fill=accent)
-        draw.ellipse((ox - 200, oy - 18, ox - 164, oy + 18), fill=white)
-        of = _font(26, "bold")
-        _text_outline(draw, (ox, oy), short[:18], of, fill=dark, outline=white, width=3, anchor="rm")
+        _pill(draw, (m, CARD_H - m - 52), short[:18], accent, white, _font(22, "semi"))
 
     return canvas
 
 
 def _slide_callouts(data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]) -> Image.Image:
-    soft, dark, white, accent, deep = palette
+    """Слайд деталей: товар слева, 3 плашки справа со стрелками."""
+    soft, dark, white, accent, _deep = palette
     canvas = _gradient((CARD_W, CARD_H), white, soft)
     draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
 
-    draw.text((64, 64), "ДЕТАЛИ", font=_font(24, "semi"), fill=accent)
+    draw.text((m, m), "ДЕТАЛИ", font=_font(22, "semi"), fill=accent)
     title_font, title_lines, title_size = _fit_title(
-        draw, data["title"], 640, max_lines=2, start_size=42, min_size=30
+        draw, data["title"], CARD_W - m * 2 - 40, max_lines=2, start_size=40, min_size=28
     )
-    _draw_lines(draw, title_lines, title_font, 64, 104, dark, max(40, int(title_size * 1.2)))
+    _draw_lines(draw, title_lines, title_font, m, m + 40, dark, max(38, int(title_size * 1.15)))
 
     if product is not None:
-        cx, cy = _place_in_box(canvas, product, (40, 300, 660, 1280))
+        cx, cy = _place_in_box(canvas, product, (m - 10, 280, 620, CARD_H - m))
     else:
-        draw.rounded_rectangle((100, 360, 660, 1180), radius=28, fill=soft)
-        cx, cy = 360, 780
+        draw.rounded_rectangle((m, 360, 600, CARD_H - m - 40), radius=28, fill=soft)
+        cx, cy = 320, 780
 
     callout_font = _font(26, "semi")
-    box_left, box_right = 760, 1036
-    text_pad = 20
+    box_right = CARD_W - m
+    box_left = 700
+    text_pad = 22
     text_max = box_right - box_left - text_pad * 2
-    slots = [400, 640, 880]
-    for i, text in enumerate(data["callouts"][:3]):
+    items = data["callouts"][:3] or data["bullets"][:3]
+    slots = [420, 700, 980]
+    for i, text in enumerate(items):
         ty = slots[i]
         wrapped = _wrap(draw, text, callout_font, text_max, max_lines=2)
+        if not wrapped:
+            continue
         line_heights = []
         for ln in wrapped:
             b = draw.textbbox((0, 0), ln, font=callout_font)
             line_heights.append(b[3] - b[1])
         content_h = sum(line_heights) + 6 * max(0, len(wrapped) - 1)
-        block_h = max(64, content_h + 28)
+        block_h = max(72, content_h + 32)
         content_w = max((_text_w(draw, ln, callout_font) for ln in wrapped), default=0)
-        bw = int(min(box_right - box_left, max(180, content_w + text_pad * 2)))
+        bw = int(min(box_right - box_left, max(200, content_w + text_pad * 2)))
         bx1 = box_right - bw
         by1 = ty - block_h // 2
         by2 = by1 + block_h
-        draw.rounded_rectangle((bx1, by1, box_right, by2), radius=18, fill=white)
-        anchor_y = cy - 80 + i * 90
-        draw.line((cx + 36, anchor_y, bx1 - 8, ty), fill=accent, width=3)
-        draw.ellipse((cx + 28, anchor_y - 8, cx + 44, anchor_y + 8), fill=accent)
-        draw.ellipse((bx1 - 14, ty - 8, bx1 + 2, ty + 8), fill=accent)
+        draw.rounded_rectangle(
+            (bx1 + 4, by1 + 6, box_right + 4, by2 + 6),
+            radius=20,
+            fill=_mix_hex(soft, "#000000", 0.08),
+        )
+        draw.rounded_rectangle((bx1, by1, box_right, by2), radius=20, fill=white)
+        draw.rounded_rectangle((bx1, by1, bx1 + 8, by2), radius=4, fill=accent)
+        anchor_y = cy - 100 + i * 100
+        draw.line((cx + 40, anchor_y, bx1 - 10, ty), fill=accent, width=3)
+        draw.ellipse((cx + 32, anchor_y - 8, cx + 48, anchor_y + 8), fill=accent)
         _draw_centered_lines(
             draw,
             wrapped,
             callout_font,
-            (bx1 + text_pad // 2, by1, box_right - text_pad // 2, by2),
+            (bx1 + text_pad, by1, box_right - text_pad // 2, by2),
             dark,
             line_gap=6,
         )
@@ -726,44 +779,50 @@ def _slide_callouts(data: dict, product: Image.Image | None, palette: tuple[str,
 
 
 def _slide_benefits(data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]) -> Image.Image:
-    soft, dark, white, accent, deep = palette
-    canvas = Image.new("RGBA", (CARD_W, CARD_H), soft)
+    """Слайд выгод: 4 крупные карточки + мини-фото."""
+    soft, dark, white, accent, _deep = palette
+    canvas = _studio_background(palette)
     draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
 
-    draw.text((64, 64), "ПРЕИМУЩЕСТВА", font=_font(24, "semi"), fill=accent)
-    title_max = CARD_W - 360 if product is not None else CARD_W - 128
+    draw.text((m, m), "ПРЕИМУЩЕСТВА", font=_font(22, "semi"), fill=accent)
+    title_max = CARD_W - m * 2 - (280 if product is not None else 0)
     title_font, title_lines, title_size = _fit_title(
-        draw, data["title"], title_max, max_lines=2, start_size=42, min_size=30
+        draw, data["title"], title_max, max_lines=2, start_size=40, min_size=28
     )
-    y = _draw_lines(draw, title_lines, title_font, 64, 110, dark, max(40, int(title_size * 1.2)))
+    y = _draw_lines(draw, title_lines, title_font, m, m + 42, dark, max(38, int(title_size * 1.15)))
 
     if product is not None:
-        frame = (CARD_W - 300, 96, CARD_W - 56, 360)
-        draw.rounded_rectangle(frame, radius=24, fill=white)
+        frame = (CARD_W - m - 240, m, CARD_W - m, m + 240)
+        draw.rounded_rectangle(frame, radius=28, fill=white)
         _place_in_box(
             canvas,
             product,
-            (frame[0] + 20, frame[1] + 20, frame[2] - 20, frame[3] - 20),
+            (frame[0] + 16, frame[1] + 16, frame[2] - 16, frame[3] - 16),
         )
 
     items = data["bullets"][:4] or data["callouts"][:4]
     card_font = _font(30, "semi")
-    num_font = _font(26, "bold")
-    top = max(y + 40, 400)
-    gap = 24
-    card_h = 156
-    card_x1, card_x2 = 64, CARD_W - 64
-    circle = 72
+    num_font = _font(28, "bold")
+    top = max(y + 36, 320)
+    gap = 22
+    card_h = 168
+    card_x1, card_x2 = m, CARD_W - m
+    circle = 76
     inner_gap = 28
-    side_pad = 40
+    side_pad = 36
 
     for i, item in enumerate(items):
         yy = top + i * (card_h + gap)
-        if yy + card_h > CARD_H - 120:
+        if yy + card_h > CARD_H - m:
             break
+        draw.rounded_rectangle(
+            (card_x1 + 3, yy + 5, card_x2 + 3, yy + card_h + 5),
+            radius=28,
+            fill=_mix_hex(soft, "#000000", 0.07),
+        )
         draw.rounded_rectangle((card_x1, yy, card_x2, yy + card_h), radius=28, fill=white)
 
-        # Текст не выходит за карточку; группа (номер+текст) по центру
         max_text_w = (card_x2 - card_x1) - side_pad * 2 - circle - inner_gap
         wrapped = _wrap(draw, item, card_font, max_text_w, max_lines=2)
         text_w = int(max((_text_w(draw, ln, card_font) for ln in wrapped), default=0))
@@ -792,9 +851,355 @@ def _slide_benefits(data: dict, product: Image.Image | None, palette: tuple[str,
             line_gap=6,
         )
 
-    if data["origin"]:
-        _pill(draw, (64, CARD_H - 100), data["origin"], accent, white, _font(22, "semi"))
+    if data.get("origin"):
+        _pill(draw, (m, CARD_H - m - 52), data["origin"], accent, white, _font(22, "semi"))
     return canvas
+
+
+def _dominant_accent(product: Image.Image | None) -> str | None:
+    """Мягкий accent из среднего цвета непрозрачных пикселей товара."""
+    if product is None:
+        return None
+    try:
+        img = product.convert("RGBA")
+        img.thumbnail((96, 96))
+        pixels = list(img.getdata())
+        rs = gs = bs = n = 0
+        for r, g, b, a in pixels:
+            if a < 160:
+                continue
+            if r > 245 and g > 245 and b > 245:
+                continue
+            if r < 18 and g < 18 and b < 18:
+                continue
+            rs += r
+            gs += g
+            bs += b
+            n += 1
+        if n < 20:
+            return None
+        r, g, b = rs // n, gs // n, bs // n
+        return f"#{r:02X}{g:02X}{b:02X}"
+    except Exception:
+        return None
+
+
+def _fit_scene_photo(photo: Image.Image, box: tuple[int, int, int, int]) -> Image.Image:
+    """Contain product/scene in box with soft blurred fill (no crop of the subject)."""
+    x0, y0, x1, y1 = box
+    bw, bh = max(1, x1 - x0), max(1, y1 - y0)
+    # RGBA cutout → flatten onto soft beige (never convert RGBA→RGB via black matte)
+    if photo.mode == "RGBA":
+        src = Image.new("RGB", photo.size, (236, 228, 218))
+        src.paste(photo, mask=photo.split()[-1])
+    else:
+        src = photo.convert("RGB")
+    sw, sh = src.size
+    scale = min(bw / max(1, sw), bh / max(1, sh))
+    nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+    fitted = src.resize((nw, nh), Image.Resampling.LANCZOS)
+
+    fill = src.resize((bw, bh), Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(28))
+    fill = ImageEnhance.Brightness(fill).enhance(0.92)
+    canvas = Image.new("RGB", (bw, bh), (236, 228, 218))
+    canvas.paste(fill, (0, 0))
+    canvas.paste(fitted, ((bw - nw) // 2, (bh - nh) // 2))
+    return canvas
+
+
+def _paste_scene(canvas: Image.Image, product: Image.Image | None) -> None:
+    if product is None:
+        return
+    scene = _fit_scene_photo(product, (0, 0, CARD_W, CARD_H))
+    canvas.paste(scene, (0, 0))
+
+
+def _bottom_veil(canvas: Image.Image, height: int = 360, strength: float = 0.72) -> Image.Image:
+    """Soft dark gradient at bottom; keeps most of the product visible above."""
+    base = canvas.convert("RGBA")
+    veil = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    vd = ImageDraw.Draw(veil)
+    h = max(80, min(height, CARD_H // 2))
+    for i in range(h):
+        a = int(255 * strength * ((i / h) ** 1.35))
+        vd.line([(0, CARD_H - h + i), (CARD_W, CARD_H - h + i)], fill=(18, 14, 12, a))
+    return Image.alpha_composite(base, veil).convert("RGB")
+
+
+def _slide_hero_lifestyle(
+    data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]
+) -> Image.Image:
+    """Lifestyle cover: полный товар в сцене (contain) + мягкая подпись снизу."""
+    soft, dark, white, accent, _deep = palette
+    canvas = Image.new("RGB", (CARD_W, CARD_H), soft)
+    _paste_scene(canvas, product)
+    canvas = _bottom_veil(canvas, height=300, strength=0.68)
+    draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
+
+    eyebrow = "В ИНТЕРЬЕРЕ"
+    ef = _font(22, "semi")
+    draw.text((CARD_W / 2, CARD_H - 250), eyebrow, font=ef, fill=white, anchor="mm")
+
+    title_font, title_lines, title_size = _fit_title(
+        draw, data["title"], CARD_W - m * 2, max_lines=3, start_size=44, min_size=28
+    )
+    y = CARD_H - 210
+    lh = max(40, int(title_size * 1.12))
+    for line in title_lines:
+        draw.text((CARD_W / 2, y + title_size / 2), line, font=title_font, fill=white, anchor="mm")
+        y += lh
+    return canvas
+
+
+def _slide_callouts_lifestyle(
+    data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]
+) -> Image.Image:
+    """Lifestyle детали: полная сцена + 3 нумерованные плашки."""
+    soft, dark, white, accent, _deep = palette
+    canvas = Image.new("RGB", (CARD_W, CARD_H), soft)
+    _paste_scene(canvas, product)
+    canvas = _bottom_veil(canvas, height=520, strength=0.78)
+    draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
+
+    eyebrow = "В ИНТЕРЬЕРЕ"
+    draw.text((CARD_W / 2, CARD_H - 490), eyebrow, font=_font(22, "semi"), fill=white, anchor="mm")
+
+    title_font, title_lines, title_size = _fit_title(
+        draw, data["title"], CARD_W - m * 2, max_lines=2, start_size=40, min_size=26
+    )
+    y = CARD_H - 450
+    lh = max(38, int(title_size * 1.12))
+    for line in title_lines:
+        draw.text((CARD_W / 2, y + title_size / 2), line, font=title_font, fill=white, anchor="mm")
+        y += lh
+
+    items = data["callouts"][:3] or data["bullets"][:3]
+    body = _font(26, "semi")
+    num_font = _font(22, "bold")
+    y += 20
+    for i, text in enumerate(items, start=1):
+        if not text:
+            continue
+        pill_h = 76
+        x1, x2 = m + 20, CARD_W - m - 20
+        draw.rounded_rectangle((x1, y, x2, y + pill_h), radius=38, fill=white)
+        cx, cy = x1 + 44, y + pill_h // 2
+        draw.ellipse((cx - 24, cy - 24, cx + 24, cy + 24), fill=accent)
+        draw.text((cx, cy), str(i), font=num_font, fill=white, anchor="mm")
+        wrapped = _wrap(draw, text, body, x2 - (x1 + 90) - 24, max_lines=2) or [text]
+        _draw_centered_lines(
+            draw,
+            wrapped,
+            body,
+            (x1 + 90, y, x2 - 24, y + pill_h),
+            dark,
+            line_gap=4,
+        )
+        y += pill_h + 16
+    return canvas
+
+
+def _slide_benefits_lifestyle(
+    data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]
+) -> Image.Image:
+    """Lifestyle выгоды: сцена сверху (полный товар) + карточки преимуществ снизу."""
+    soft, dark, white, accent, _deep = palette
+    canvas = _studio_background(palette)
+    draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
+
+    draw.text((CARD_W / 2, m + 8), "ПОЧЕМУ ЭТОТ ТОВАР", font=_font(22, "semi"), fill=accent, anchor="mm")
+    title_font, title_lines, title_size = _fit_title(
+        draw, data["title"], CARD_W - m * 2, max_lines=2, start_size=40, min_size=26
+    )
+    y = m + 48
+    lh = max(38, int(title_size * 1.12))
+    for line in title_lines:
+        draw.text((CARD_W / 2, y + title_size / 2), line, font=title_font, fill=dark, anchor="mm")
+        y += lh
+
+    # Scene strip — contain, rounded
+    strip_top = int(y + 20)
+    strip_bottom = strip_top + 420
+    frame = (m, strip_top, CARD_W - m, strip_bottom)
+    if product is not None:
+        fitted = _fit_scene_photo(product, (0, 0, frame[2] - frame[0], frame[3] - frame[1]))
+        mask = Image.new("L", fitted.size, 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, fitted.size[0] - 1, fitted.size[1] - 1), radius=28, fill=255
+        )
+        canvas.paste(fitted, (frame[0], frame[1]), mask)
+    else:
+        draw.rounded_rectangle(frame, radius=28, fill=white)
+
+    items = data["bullets"][:4] or data["callouts"][:4]
+    body = _font(26, "semi")
+    by = strip_bottom + 28
+    for item in items:
+        if not item or by + 78 > CARD_H - m:
+            break
+        draw.rounded_rectangle((m, by, CARD_W - m, by + 72), radius=20, fill=white)
+        draw.rectangle((m, by + 16, m + 8, by + 56), fill=accent)
+        wrapped = _wrap(draw, item, body, CARD_W - m * 2 - 48, max_lines=1) or [item]
+        tw = _text_w(draw, wrapped[0], body)
+        draw.text(((CARD_W - tw) / 2, by + 22), wrapped[0], font=body, fill=dark)
+        by += 88
+    return canvas.convert("RGB")
+
+
+def _slide_hero_editorial(
+    data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]
+) -> Image.Image:
+    """Постер: мягкое поле + крупный заголовок + полный товар."""
+    soft, dark, white, accent, _deep = palette
+    field = _mix_hex(soft, white, 0.35)
+    canvas = Image.new("RGB", (CARD_W, CARD_H), field)
+    overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    ar, ag, ab = _hex_rgb(accent)
+    for cx, cy, r, a in (
+        (140, 200, 220, 38),
+        (CARD_W - 80, 560, 260, 32),
+        (CARD_W // 2, CARD_H - 40, 280, 26),
+    ):
+        od.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(ar, ag, ab, a))
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay)
+    draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
+
+    label = "ПОСТЕР"
+    lf = _font(20, "semi")
+    lw = int(_text_w(draw, label, lf)) + 44
+    _pill(draw, ((CARD_W - lw) // 2, m - 4), label, accent, white, lf)
+
+    title_font, title_lines, title_size = _fit_title(
+        draw, data["title"].upper(), CARD_W - m * 2, max_lines=3, start_size=48, min_size=28
+    )
+    y = m + 64
+    lh = max(44, int(title_size * 1.15))
+    for line in title_lines:
+        draw.text((CARD_W / 2, y + title_size / 2), line, font=title_font, fill=dark, anchor="mm")
+        y += lh
+
+    hook = (data.get("hook") or "").strip()
+    if hook:
+        hf = _font(26, "semi")
+        for line in _wrap(draw, hook, hf, CARD_W - m * 2 - 40, max_lines=2):
+            draw.text((CARD_W / 2, y + 16), line, font=hf, fill=_mix_hex(dark, accent, 0.35), anchor="mm")
+            y += 36
+
+    photo_top = int(max(y + 28, 280))
+    if product is not None:
+        _place_in_box(canvas, product, (m + 40, photo_top, CARD_W - m - 40, CARD_H - m - 20))
+    return canvas.convert("RGB")
+
+
+def _slide_callouts_editorial(
+    data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]
+) -> Image.Image:
+    """Постер детали: товар сверху целиком + сетка фактов."""
+    soft, dark, white, accent, _deep = palette
+    field = _mix_hex(soft, white, 0.4)
+    canvas = Image.new("RGBA", (CARD_W, CARD_H), (*_hex_rgb(field), 255))
+    draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
+
+    draw.text((CARD_W / 2, m), "ПОСТЕР · ДЕТАЛИ", font=_font(22, "semi"), fill=accent, anchor="mm")
+    title_font, title_lines, title_size = _fit_title(
+        draw, data["title"], CARD_W - m * 2, max_lines=2, start_size=40, min_size=26
+    )
+    y = m + 40
+    for line in title_lines:
+        draw.text((CARD_W / 2, y + title_size / 2), line, font=title_font, fill=dark, anchor="mm")
+        y += max(38, int(title_size * 1.12))
+
+    photo_bottom = int(y + 460)
+    if product is not None:
+        _place_in_box(canvas, product, (m + 60, int(y + 16), CARD_W - m - 60, photo_bottom))
+
+    items = [t for t in (data["callouts"][:4] or data["bullets"][:4]) if t]
+    body = _font(24, "semi")
+    num_font = _font(22, "bold")
+    gap = 16
+    top = photo_bottom + 24
+    # 1–3 пункта — в столбик (без «дырки» в сетке 2×2); 4 — сетка 2×2
+    if len(items) <= 3:
+        cell_h = 90
+        for i, text in enumerate(items, start=1):
+            yy = top + (i - 1) * (cell_h + gap)
+            if yy + cell_h > CARD_H - m:
+                break
+            draw.rounded_rectangle((m, yy, CARD_W - m, yy + cell_h), radius=22, fill=white)
+            draw.ellipse((m + 18, yy + 21, m + 62, yy + 65), fill=accent)
+            draw.text((m + 40, yy + 43), str(i), font=num_font, fill=white, anchor="mm")
+            wrapped = _wrap(draw, text, body, CARD_W - m * 2 - 100, max_lines=2) or [text]
+            _draw_centered_lines(
+                draw, wrapped, body, (m + 78, yy + 8, CARD_W - m - 20, yy + cell_h - 8), dark, line_gap=4
+            )
+    else:
+        cols = 2
+        cell_w = (CARD_W - m * 2 - gap) // cols
+        cell_h = 120
+        for i, text in enumerate(items):
+            col, row = i % cols, i // cols
+            x1 = m + col * (cell_w + gap)
+            yy = top + row * (cell_h + gap)
+            if yy + cell_h > CARD_H - m:
+                break
+            draw.rounded_rectangle((x1, yy, x1 + cell_w, yy + cell_h), radius=22, fill=white)
+            draw.ellipse((x1 + 18, yy + 18, x1 + 62, yy + 62), fill=accent)
+            draw.text((x1 + 40, yy + 40), str(i + 1), font=num_font, fill=white, anchor="mm")
+            wrapped = _wrap(draw, text, body, cell_w - 90, max_lines=2) or [text]
+            _draw_centered_lines(
+                draw, wrapped, body, (x1 + 72, yy + 12, x1 + cell_w - 16, yy + cell_h - 12), dark, line_gap=4
+            )
+    return canvas.convert("RGB")
+
+
+def _slide_benefits_editorial(
+    data: dict, product: Image.Image | None, palette: tuple[str, str, str, str, str]
+) -> Image.Image:
+    """Постер выгоды: список плюсов + полный товар снизу."""
+    soft, dark, white, accent, _deep = palette
+    field = _mix_hex(soft, white, 0.4)
+    canvas = Image.new("RGBA", (CARD_W, CARD_H), (*_hex_rgb(field), 255))
+    overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    ar, ag, ab = _hex_rgb(accent)
+    od.ellipse((-60, 60, 280, 400), fill=(ar, ag, ab, 30))
+    od.ellipse((CARD_W - 200, CARD_H - 360, CARD_W + 80, CARD_H + 40), fill=(ar, ag, ab, 28))
+    canvas = Image.alpha_composite(canvas, overlay)
+    draw = ImageDraw.Draw(canvas)
+    m = _safe_margin()
+
+    draw.text((CARD_W / 2, m), "ПОСТЕР · ПЛЮСЫ", font=_font(22, "semi"), fill=accent, anchor="mm")
+    title_font, title_lines, title_size = _fit_title(
+        draw, data["title"], CARD_W - m * 2, max_lines=2, start_size=40, min_size=26
+    )
+    y = m + 42
+    for line in title_lines:
+        draw.text((CARD_W / 2, y + title_size / 2), line, font=title_font, fill=dark, anchor="mm")
+        y += max(38, int(title_size * 1.12))
+
+    items = data["bullets"][:4] or data["callouts"][:4]
+    body = _font(26, "semi")
+    by = y + 20
+    for item in items:
+        if not item:
+            continue
+        draw.rounded_rectangle((m, by, CARD_W - m, by + 74), radius=18, fill=white)
+        draw.ellipse((m + 18, by + 17, m + 56, by + 55), fill=accent)
+        # check
+        draw.line([(m + 28, by + 36), (m + 36, by + 44), (m + 46, by + 28)], fill=white, width=3)
+        wrapped = _wrap(draw, item, body, CARD_W - m * 2 - 100, max_lines=1) or [item]
+        draw.text((m + 72, by + 22), wrapped[0], font=body, fill=dark)
+        by += 90
+
+    if product is not None and by + 200 < CARD_H - m:
+        _place_in_box(canvas, product, (m + 80, by + 10, CARD_W - m - 80, CARD_H - m - 10))
+    return canvas.convert("RGB")
 
 
 def render_product_card(
@@ -812,20 +1217,39 @@ def render_product_card_pack(
     data: dict,
     photo: Path | None = None,
     stem: str = "card",
+    variant: str = "catalog",
 ) -> list[Path]:
     """
-    Набор из 3 слайдов как у карточек WB/Ozon:
-    1) обложка (CTR), 2) детали с выносками, 3) преимущества.
+    Набор из 3 слайдов.
+    variant: catalog | lifestyle | editorial
     """
     prepared = _prepare_data(data)
-    palette = _palette(prepared["title"], prepared["accent"])
     product = _load_photo(photo)
+    accent = prepared.get("accent") or _dominant_accent(product)
+    palette = _palette(prepared["title"], accent)
+    variant = (variant or "catalog").strip().lower()
+    if variant not in {"catalog", "lifestyle", "editorial"}:
+        variant = "catalog"
 
-    slides = [
-        ("hero", _slide_hero(prepared, product, palette)),
-        ("details", _slide_callouts(prepared, product, palette)),
-        ("benefits", _slide_benefits(prepared, product, palette)),
-    ]
+    if variant == "lifestyle":
+        slides = [
+            ("hero", _slide_hero_lifestyle(prepared, product, palette)),
+            ("details", _slide_callouts_lifestyle(prepared, product, palette)),
+            ("benefits", _slide_benefits_lifestyle(prepared, product, palette)),
+        ]
+    elif variant == "editorial":
+        slides = [
+            ("hero", _slide_hero_editorial(prepared, product, palette)),
+            ("details", _slide_callouts_editorial(prepared, product, palette)),
+            ("benefits", _slide_benefits_editorial(prepared, product, palette)),
+        ]
+    else:
+        slides = [
+            ("hero", _slide_hero(prepared, product, palette)),
+            ("details", _slide_callouts(prepared, product, palette)),
+            ("benefits", _slide_benefits(prepared, product, palette)),
+        ]
+
     dest_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for name, img in slides:
