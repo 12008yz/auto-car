@@ -188,6 +188,20 @@ class TestIntentRouter(unittest.TestCase):
                 self.assertTrue(self.looks_like_apply_pending(text), msg=text)
         self.assertFalse(self.looks_like_apply_pending("год должен быть 9991"))
         self.assertFalse(self.looks_like_apply_pending("Замени Иванова на Петрова"))
+        self.assertFalse(
+            self.looks_like_apply_pending(
+                "Нужно перевернуть все слова в файле и скинуть мне его"
+            )
+        )
+
+    def test_chitchat_and_gap_value(self) -> None:
+        from llm.client import looks_like_chitchat, looks_like_short_gap_value, _extract_person_facts
+
+        self.assertTrue(looks_like_chitchat("Привет браток"))
+        self.assertFalse(looks_like_chitchat("Замени Иванова на Петрова"))
+        self.assertTrue(looks_like_short_gap_value("Богородицк"))
+        self.assertFalse(looks_like_short_gap_value("Что в договоре?"))
+        self.assertEqual(_extract_person_facts("Богородицк").get("city"), "Богородицк")
 
 
 class TestPersonFacts(unittest.TestCase):
@@ -250,8 +264,65 @@ class TestDocSession(unittest.TestCase):
 
         session = UserSession(user_id=2)
         session.remember_doc_task("fill", "тест", accumulate_facts=True)
+        session.set_awaiting_confirm("fill")
         session.reset_memory()
         self.assertIsNone(session.doc_task)
+        self.assertEqual(session.flow, "idle")
+        self.assertEqual(session.last_op, "")
+
+    def test_flow_helpers(self) -> None:
+        from bot.session import PendingEdit, UserSession
+        from pathlib import Path
+
+        session = UserSession(user_id=3)
+        session.pending = PendingEdit(kind="patch", source=Path("x.docx"), patches=[])
+        session.set_awaiting_confirm("patch")
+        self.assertEqual(session.flow, "awaiting_confirm")
+        self.assertEqual(session.last_op, "patch")
+        session.clear_pending_flow()
+        self.assertIsNone(session.pending)
+        self.assertEqual(session.flow, "idle")
+        session.finish_op("reverse_words")
+        self.assertEqual(session.last_op, "reverse_words")
+        self.assertEqual(session.flow, "idle")
+
+    def test_gap_fill_followup(self) -> None:
+        from bot.session import UserSession
+
+        session = UserSession(user_id=5)
+        session.remember_gaps(
+            "1) Пустые поля:\n- [адрес]\n3) Укажите адрес регистрации."
+        )
+        self.assertTrue(session.awaiting_gap_fill)
+        self.assertIn("[адрес]", session.doc_task.gap_fields)
+        instr = session.gap_fill_instruction("Богородицк")
+        self.assertFalse(session.awaiting_gap_fill)
+        self.assertIn("Богородицк", instr)
+        self.assertIn("Богородицк", session.doc_task.facts)
+        self.assertEqual(session.doc_task.kind, "fill")
+
+    def test_ingest_clears_awaiting_confirm(self) -> None:
+        from bot.handlers import _ingest_path
+        from bot.session import PendingEdit, UserSession
+        from edit.docx_patch import write_structured_docx
+
+        session = UserSession(user_id=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.docx"
+            write_structured_docx(
+                path,
+                title="T",
+                sections=[{"heading": None, "paragraphs": ["hi"]}],
+                doc_type="doc",
+                layout="text",
+            )
+            session.pending = PendingEdit(kind="rewrite", source=path, rewrite_text="x")
+            session.set_awaiting_confirm("rewrite")
+            n = _ingest_path(session, path)
+            self.assertGreater(n, 0)
+            self.assertIsNone(session.pending)
+            self.assertEqual(session.flow, "idle")
+            self.assertEqual(session.active_path, path)
 
 
 class TestDocxWriter(unittest.TestCase):
@@ -319,6 +390,38 @@ class TestReverseWords(unittest.TestCase):
             blob = "\n".join(p.text for p in Document(str(dest)).paragraphs)
             self.assertIn("9991", blob)
             self.assertNotIn("1999", blob)
+
+
+class TestTransformCatalog(unittest.TestCase):
+    def test_detect_transform(self) -> None:
+        from edit.transforms import detect_transform
+
+        self.assertEqual(
+            detect_transform("Нужно перевернуть все слова в файле и скинуть"),
+            "reverse_words",
+        )
+        self.assertEqual(detect_transform("сделай всё заглавными буквами"), "upper_case")
+        self.assertEqual(detect_transform("сделай нижний регистр"), "lower_case")
+        self.assertIsNone(detect_transform("Что в договоре про срок?"))
+
+    def test_apply_upper_case(self) -> None:
+        from docx import Document
+        from edit.docx_patch import write_structured_docx
+        from edit.transforms import apply_transform
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.docx"
+            dest = Path(tmp) / "out.docx"
+            write_structured_docx(
+                src,
+                title="Hello",
+                sections=[{"heading": None, "paragraphs": ["Год: 1999"]}],
+                doc_type="doc",
+                layout="text",
+            )
+            apply_transform("upper_case", src, dest)
+            blob = "\n".join(p.text for p in Document(str(dest)).paragraphs)
+            self.assertIn("ГОД: 1999", blob)
 
 
 class TestUiWiring(unittest.TestCase):

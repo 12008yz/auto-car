@@ -42,11 +42,11 @@ from docs.loaders import load_document
 from edit.docx_patch import (
     apply_patches,
     filter_valid_patches,
-    reverse_words_docx,
     suggest_filename,
     write_rewrite_docx,
     write_structured_docx,
 )
+from edit.transforms import apply_transform, detect_transform
 from llm.client import (
     analyze_contract_risks,
     apply_document_routing_guards,
@@ -60,9 +60,11 @@ from llm.client import (
     generate_product_photo,
     looks_like_apply_pending,
     looks_like_card,
+    looks_like_chitchat,
     looks_like_edit,
     looks_like_fill_data,
     looks_like_reverse_words,
+    looks_like_short_gap_value,
     looks_like_tone,
     make_product_card,
     plan_edits,
@@ -280,6 +282,7 @@ async def _materialize_pending(session: UserSession) -> tuple[Path | None, str]:
             pending = session.pending
             if pending is None:
                 return None, "Нет черновика правок"
+            op = session.last_op or pending.kind or "edit"
             session.pending = None
             dest = _unique_edited_path(dest_dir, pending.source)
             if pending.kind == "patch":
@@ -293,11 +296,14 @@ async def _materialize_pending(session: UserSession) -> tuple[Path | None, str]:
                 await asyncio.to_thread(write_rewrite_docx, dest, pending.rewrite_text)
                 note = "Готовый файл с новым текстом."
             else:
+                session.flow = "idle"
                 return None, "Нечего применять."
             await asyncio.to_thread(_ingest_path, session, dest)
+            session.flow = "idle"
+            session.remember_op(op)
             return dest, note
     except Exception as exc:
-        session.pending = None
+        session.clear_pending_flow()
         return None, f"Не удалось сохранить правки: {exc}"
 
 
@@ -346,7 +352,10 @@ def _ingest_path(session: UserSession, path: Path) -> int:
     chunks = chunk_blocks(blocks, source=path.name)
     session.index.add_file(path, chunks)
     session.active_path = path
+    # Новый/обновлённый файл сбрасывает незавершённый черновик правок
     session.pending = None
+    if session.flow == "awaiting_confirm":
+        session.flow = "idle"
     return len(chunks)
 
 
@@ -918,7 +927,8 @@ async def on_document(message: Message) -> None:
     if n_chunks == 0:
         await status.edit_text(
             f"Файл {name} сохранён, но текста из него не достал. "
-            "Сканы PDF без текстового слоя так не читаются."
+            "Сканы PDF без текстового слоя так не читаются.",
+            reply_markup=ui.docs_inline(),
         )
         return
     # Документ в чате — выходим из режима карточки, иначе следующий текст
@@ -927,16 +937,20 @@ async def on_document(message: Message) -> None:
     await status.edit_text(
         f"✅ <b>{escape(name)}</b> загружен\n"
         f"Фрагментов: {n_chunks}\n\n"
-        "Можно задать вопрос по тексту или попросить правку "
-        "(.docx).",
+        "Можно задать вопрос или попросить правку (.docx).\n"
+        "Или выберите действие ниже.",
         parse_mode="HTML",
+        reply_markup=ui.docs_inline(),
     )
     caption = (message.caption or "").strip()
     if caption and not caption.startswith("/"):
-        if looks_like_fill_data(caption):
+        if detect_transform(caption):
+            session.remember_doc_task("edit", caption)
+            await _handle_edit(message, session, caption)
+        elif looks_like_fill_data(caption):
             session.remember_doc_task("fill", caption, accumulate_facts=True)
             await _handle_edit(message, session, caption, mode="fill")
-        elif looks_like_edit(caption) or looks_like_reverse_words(caption):
+        elif looks_like_edit(caption):
             session.remember_doc_task("edit", caption)
             await _handle_edit(message, session, caption)
         else:
@@ -952,6 +966,7 @@ async def on_edit_cancel(query: CallbackQuery) -> None:
         return
     async with session.lock:
         session.pending = None
+    session.flow = "idle"
     await query.answer("Отменено")
     if isinstance(query.message, Message):
         try:
@@ -990,22 +1005,33 @@ async def on_text(message: Message) -> None:
     if session is None:
         return
 
-    # Уже есть план правок (кнопки Применить/Отмена) — уточнение = новая правка,
-    # а не «создай бланк/текст».
-    if session.pending is not None:
+    # Привет / small-talk — не требуем файл
+    if looks_like_chitchat(text) and not (
+        looks_like_edit(text) or looks_like_fill_data(text) or detect_transform(text)
+    ):
+        await message.answer(
+            "Привет! Могу разобрать документ, заполнить бланк или создать Word-файл.\n"
+            "Нажмите «Документы» или пришлите файл сюда.",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+
+    # Уже есть план правок (кнопки Применить/Отмена) — подтверждение или уточнение.
+    if session.pending is not None or session.flow == "awaiting_confirm":
         session.card_mode = False
         session.pending_clarify = None
         low = text.lower()
         if low in {"отмена", "cancel", "отменить"}:
-            session.pending = None
+            session.clear_pending_flow()
             await message.answer("Правки отменены.")
             return
-        if looks_like_reverse_words(text):
+        transform_op = detect_transform(text)
+        if transform_op:
             if not await _require_files(message, session):
                 return
             await _handle_edit(message, session, text)
             return
-        if looks_like_apply_pending(text):
+        if session.pending is not None and looks_like_apply_pending(text):
             dest, note = await _materialize_pending(session)
             if dest is None:
                 await message.answer(note or "Черновик правок уже неактуален.")
@@ -1013,17 +1039,55 @@ async def on_text(message: Message) -> None:
             await message.answer(_fit(note))
             await message.answer_document(FSInputFile(dest), caption=dest.name)
             return
-        if not await _require_files(message, session):
+        if session.pending is None:
+            session.flow = "idle"
+        else:
+            if not await _require_files(message, session):
+                return
+            await _handle_edit(message, session, text)
             return
-        await _handle_edit(message, session, text)
-        return
 
     has_files = bool(session.index.files)
+
+    # После «что не заполнено» короткое «Богородицк» = заполнение поля, не поиск
+    if (
+        has_files
+        and session.awaiting_gap_fill
+        and looks_like_short_gap_value(text)
+        and not detect_transform(text)
+    ):
+        session.card_mode = False
+        instruction = session.gap_fill_instruction(text)
+        await _handle_edit(message, session, instruction, mode="fill")
+        return
+
+    # «Вставь их туда» при уже накопленных фактах / после gaps
+    if (
+        has_files
+        and (
+            looks_like_fill_data(text)
+            or (
+                session.doc_task
+                and session.doc_task.facts
+                and any(k in text.lower() for k in ("вставь", "добав", "подставь", "заполни"))
+            )
+        )
+        and not detect_transform(text)
+    ):
+        # ниже обычный edit/fill роутинг подхватит; форсируем fill
+        pass
+
     decision = classify_document_intent(text, has_files=has_files)
     decision = apply_document_routing_guards(decision, text=text, has_files=has_files)
     intent = str(decision.get("intent") or "none")
     edit_mode = str(decision.get("mode") or "")
-    fillish = looks_like_edit(text) or looks_like_fill_data(text) or looks_like_reverse_words(text)
+    transform_op = detect_transform(text)
+    fillish = (
+        looks_like_edit(text)
+        or looks_like_fill_data(text)
+        or looks_like_reverse_words(text)
+        or bool(transform_op)
+    )
 
     # При файлах никогда не показываем clarify «бланк/текст» — это частый косяк
     if has_files and intent == "clarify" and str(decision.get("family") or "") == "write":
@@ -1033,23 +1097,42 @@ async def on_text(message: Message) -> None:
     if (
         has_files
         and session.doc_task
-        and session.doc_task.kind == "fill"
         and session.doc_task.facts
         and any(
             k in text.lower()
-            for k in ("добав", "эти данн", "вставь", "заполни", "фио", "подставь")
+            for k in (
+                "добав",
+                "эти данн",
+                "вставь",
+                "встав ",
+                "заполни",
+                "фио",
+                "подставь",
+                "туда",
+            )
         )
         and not looks_like_reverse_words(text)
+        and not detect_transform(text)
     ):
         fillish = True
         intent = "edit"
         edit_mode = "fill"
 
-    if looks_like_tone(text) and has_files and not looks_like_reverse_words(text):
+    if (
+        looks_like_tone(text)
+        and has_files
+        and not looks_like_reverse_words(text)
+        and not detect_transform(text)
+    ):
         intent = "edit"
         edit_mode = "tone"
 
     if looks_like_reverse_words(text) and has_files:
+        intent = "edit"
+        edit_mode = "edit"
+        fillish = True
+
+    if transform_op and has_files:
         intent = "edit"
         edit_mode = "edit"
         fillish = True
@@ -1103,6 +1186,7 @@ async def on_text(message: Message) -> None:
                 options=options,
                 question=question,
             )
+            session.set_clarifying()
             await message.answer(
                 ui.clarify_prompt_text(escape(question)),
                 parse_mode="HTML",
@@ -1123,7 +1207,7 @@ async def on_text(message: Message) -> None:
             if not await _require_files(message, session):
                 return
             mode = "auto"
-            if looks_like_reverse_words(text):
+            if transform_op or looks_like_reverse_words(text):
                 mode = "auto"
             elif edit_mode == "fill" or looks_like_fill_data(text):
                 mode = "fill"
@@ -1176,6 +1260,7 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
 
     if action == "cancel":
         session.pending_clarify = None
+        session.flow = "idle"
         try:
             await query.message.edit_text("Ок, отменил.")
         except Exception:
@@ -1184,6 +1269,7 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
 
     if action == "need_file":
         session.pending_clarify = None
+        session.flow = "idle"
         await query.message.answer(
             "Пришлите .docx в чат, затем повторите правку.\n"
             "Пример: «Замени Иванова на Петрова».",
@@ -1201,6 +1287,7 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
 
     prompt = pending.prompt
     session.pending_clarify = None
+    session.flow = "idle"
 
     if action in {"write_form", "write_text"}:
         mode = "form" if action == "write_form" else "text"
@@ -1420,9 +1507,9 @@ async def _make_card(
 
 
 async def _handle_question(message: Message, session: UserSession, text: str) -> None:
-    # Если это правка — не отвечаем текстом «это бланк», а правим файл
-    if looks_like_reverse_words(text) or looks_like_edit(text) or looks_like_fill_data(text):
-        mode = "fill" if looks_like_fill_data(text) and not looks_like_reverse_words(text) else "auto"
+    # Если это правка / transform — не отвечаем текстом, а правим файл
+    if detect_transform(text) or looks_like_reverse_words(text) or looks_like_edit(text) or looks_like_fill_data(text):
+        mode = "fill" if looks_like_fill_data(text) and not detect_transform(text) else "auto"
         await _handle_edit(message, session, text, mode=mode)
         return
     charge = await _require_quota(message, "ask")
@@ -1463,7 +1550,7 @@ async def _handle_gaps(message: Message, session: UserSession) -> None:
         _refund(message, charge, "ask")
         await status.edit_text(_fit(f"Не удалось проверить поля: {exc}"))
         return
-    session.remember_doc_task("check", "что не заполнено")
+    session.remember_gaps(text)
     await _finish_status(status, message, text)
 
 
@@ -1664,39 +1751,48 @@ async def _handle_edit(
         )
         return
 
-    if looks_like_reverse_words(text):
+    transform_op = detect_transform(text)
+    if transform_op:
         charge = await _require_quota(message, "edit")
         if charge is None:
             return
-        status = await message.answer("Переворачиваю слова в файле…")
+        labels = {
+            "reverse_words": "Переворачиваю слова в файле…",
+            "upper_case": "Делаю текст заглавными…",
+            "lower_case": "Делаю текст строчными…",
+        }
+        status = await message.answer(labels.get(transform_op, "Применяю преобразование…"))
         dest = _unique_edited_path(session.user_dir(DATA_DIR), active)
         try:
-            result = await asyncio.to_thread(reverse_words_docx, active, dest)
+            result = await asyncio.to_thread(apply_transform, transform_op, active, dest)
             async with session.lock:
                 session.pending = None
                 await asyncio.to_thread(_ingest_path, session, dest)
+            session.finish_op(transform_op)
         except Exception as exc:
             _refund(message, charge, "edit")
-            await status.edit_text(_fit(f"Не удалось перевернуть слова: {exc}"))
+            await status.edit_text(_fit(f"Не удалось применить преобразование: {exc}"))
             return
         session.remember_doc_task("edit", text)
         try:
             await status.delete()
         except Exception:
             pass
-        await message.answer(
-            f"Готово: перевернул слова в {int(result.get('changed') or 0)} абзацах."
-        )
+        changed = int(result.get("changed") or 0)
+        await message.answer(f"Готово: изменено абзацев — {changed}.")
         await message.answer_document(FSInputFile(dest), caption=dest.name)
         return
 
-    fill_mode = (mode == "fill" or looks_like_fill_data(text)) and not looks_like_reverse_words(
-        text
-    )
+    fill_mode = (mode == "fill" or looks_like_fill_data(text)) and not detect_transform(text)
     tone_mode = mode == "tone" or looks_like_tone(text)
     if fill_mode:
+        session.awaiting_gap_fill = False
         session.remember_doc_task("fill", text, accumulate_facts=True)
-        instruction = session.fill_instruction(text)
+        # Если пришла готовая инструкция из gap_fill_instruction — не дублируем обёртку
+        if "Подставь в пустые поля бланка" in text:
+            instruction = text
+        else:
+            instruction = session.fill_instruction(text)
         status_msg = "Готовлю заполнение бланка…"
         edit_mode = "fill"
     elif tone_mode:
@@ -1783,6 +1879,7 @@ async def _handle_edit(
     )
     async with session.lock:
         session.pending = pending
+        session.set_awaiting_confirm(edit_mode if edit_mode != "edit" else str(kind))
     plan = _describe_plan(pending)
     try:
         await status.delete()

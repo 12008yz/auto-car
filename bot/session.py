@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 from collections import deque
 from dataclasses import dataclass, field
@@ -36,6 +37,8 @@ class DocTask:
     last_prompt: str = ""
     facts: str = ""  # накопленные ФИО/даты/адреса для заполнения
     filename: str = ""
+    # Плейсхолдеры из «что не заполнено», напр. ["[адрес]", "[ФИО]"]
+    gap_fields: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -48,6 +51,12 @@ class UserSession:
     doc_task: DocTask | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     card_mode: bool = False
+    # idle | awaiting_confirm | clarifying
+    flow: str = "idle"
+    # fill | patch | tone | rewrite | reverse_words | ask | write | check | …
+    last_op: str = ""
+    # После «что не заполнено» ждём короткое значение (город/адрес)
+    awaiting_gap_fill: bool = False
     # Недавние message_id в этом чате — для очистки ленты
     chat_message_ids: deque[int] = field(default_factory=lambda: deque(maxlen=2000))
 
@@ -63,6 +72,27 @@ class UserSession:
     def remember_chat_message(self, message_id: int | None) -> None:
         if message_id and message_id > 0:
             self.chat_message_ids.append(int(message_id))
+
+    def remember_op(self, op: str) -> None:
+        self.last_op = (op or "").strip()
+
+    def set_awaiting_confirm(self, op: str = "") -> None:
+        self.flow = "awaiting_confirm"
+        if op:
+            self.last_op = op
+
+    def set_clarifying(self) -> None:
+        self.flow = "clarifying"
+
+    def clear_pending_flow(self) -> None:
+        self.pending = None
+        self.flow = "idle"
+
+    def finish_op(self, op: str = "") -> None:
+        self.pending = None
+        self.flow = "idle"
+        if op:
+            self.last_op = op
 
     def remember_doc_task(
         self,
@@ -103,6 +133,10 @@ class UserSession:
                 "добавь их",
                 "добавить их",
                 "вставь их",
+                "встав их",
+                "вставь туда",
+                "встав туда",
+                "их туда",
             )
         )
         if facts and (refers_prev or kind_is_fill(low) or looks_short_fill_followup(low)):
@@ -118,6 +152,34 @@ class UserSession:
             )
         return prompt
 
+    def remember_gaps(self, report: str) -> None:
+        """После проверки пустых полей — ждём значение от пользователя."""
+        fields = re.findall(r"\[[^\]\n]{1,40}\]", report or "")
+        task = self.remember_doc_task("check", "что не заполнено")
+        task.gap_fields = fields[:12]
+        self.awaiting_gap_fill = True
+        self.remember_op("check")
+
+    def gap_fill_instruction(self, value: str) -> str:
+        value = (value or "").strip()
+        task = self.doc_task
+        fields = list(task.gap_fields) if task else []
+        field_hint = ", ".join(fields) if fields else "пустые поля бланка"
+        low_fields = " ".join(fields).lower()
+        if any(k in low_fields for k in ("адрес", "город")):
+            labeled = f"город/адрес: {value}"
+        elif any(k in low_fields for k in ("фио",)):
+            labeled = f"ФИО: {value}"
+        else:
+            labeled = value
+        self.remember_doc_task("fill", labeled, accumulate_facts=True)
+        self.awaiting_gap_fill = False
+        return (
+            f"Подставь в пустые поля бланка ({field_hint}) значение пользователя: {value}\n"
+            f"Если есть поле адреса/города — используй «{value}» туда.\n"
+            f"find должен быть точным плейсхолдером или строкой из файла (например [адрес])."
+        )
+
     def reset_memory(self) -> None:
         self.index = DocumentIndex()
         self.active_path = None
@@ -125,6 +187,9 @@ class UserSession:
         self.pending_clarify = None
         self.doc_task = None
         self.card_mode = False
+        self.flow = "idle"
+        self.last_op = ""
+        self.awaiting_gap_fill = False
         self.chat_message_ids.clear()
 
 

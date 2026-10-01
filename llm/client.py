@@ -511,6 +511,30 @@ def _extract_person_facts(instruction: str) -> dict[str, str]:
             if cand.lower() not in {"года", "город", "рождения", "др"}:
                 facts["city"] = cand
 
+    # Одно слово-город: «Богородицк» или «город/адрес: Богородицк»
+    if "city" not in facts:
+        labeled = re.search(
+            r"(?:город/адрес|город|адрес|значение пользователя)\s*:\s*"
+            r"([А-ЯЁа-яёA-Za-z][А-ЯЁа-яёA-Za-z\-]{2,40})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if labeled:
+            facts["city"] = labeled.group(1).strip()
+    if "city" not in facts:
+        bare = text.strip()
+        if re.fullmatch(r"[А-ЯЁа-яёA-Za-z][А-ЯЁа-яёA-Za-z\-]{2,40}", bare):
+            if bare.lower() not in {
+                "да",
+                "нет",
+                "ок",
+                "окей",
+                "привет",
+                "здравствуйте",
+                "отмена",
+            }:
+                facts["city"] = bare
+
     if "birth_date" in facts and "года" in lowered and "рожден" in lowered:
         facts["date_role"] = "birth"
     elif "birth_date" in facts:
@@ -860,6 +884,9 @@ def looks_like_reverse_words(text: str) -> bool:
 
 def looks_like_apply_pending(text: str) -> bool:
     """Пользователь просит отдать уже подготовленный файл, а не новую правку."""
+    # Не путать с transform «переверни и скинь» — это новая операция
+    if looks_like_reverse_words(text):
+        return False
     lowered = re.sub(r"[.!?…]+$", "", (text or "").strip().lower()).strip()
     if not lowered:
         return False
@@ -891,7 +918,20 @@ def looks_like_apply_pending(text: str) -> bool:
     # «год должен быть» / точечная новая правка — не подтверждение
     if any(
         k in lowered
-        for k in ("замени", "добав", "заполни", "год должен", "исправ", "убери", "удали")
+        for k in (
+            "замени",
+            "добав",
+            "заполни",
+            "год должен",
+            "исправ",
+            "убери",
+            "удали",
+            "переверн",
+            "переверт",
+            "задом",
+            "заглавн",
+            "регистр",
+        )
     ):
         return False
     return any(
@@ -938,6 +978,9 @@ def looks_like_fill_data(text: str) -> bool:
             "заполни поле",
             "вставь туда",
             "встав туда",
+            "вставь их",
+            "встав их",
+            "их туда",
             "подставь туда",
             "заполни туда",
             "добавь туда",
@@ -993,6 +1036,89 @@ def looks_like_fill_data(text: str) -> bool:
     if has_data_word and name_triple and has_date:
         return True
     return False
+
+
+def looks_like_chitchat(text: str) -> bool:
+    """Приветствия / small-talk без документной задачи."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 80:
+        return False
+    lowered = raw.lower()
+    if any(
+        k in lowered
+        for k in (
+            "замени",
+            "добав",
+            "заполни",
+            "вставь",
+            "напиши",
+            "создай",
+            "реферат",
+            "договор",
+            "файл",
+            "бланк",
+            "карточк",
+            "проверь",
+            "сравни",
+        )
+    ):
+        return False
+    greetings = (
+        "привет",
+        "здравствуй",
+        "добрый день",
+        "доброе утро",
+        "добрый вечер",
+        "хай",
+        "hello",
+        "hi ",
+        "hi!",
+        "yo ",
+        "браток",
+        "здарова",
+        "салют",
+        "как дела",
+        "что умеешь",
+        "кто ты",
+    )
+    if any(g in lowered for g in greetings):
+        return True
+    if lowered in {"привет", "хай", "hello", "hi", "здарова", "салют"}:
+        return True
+    return False
+
+
+def looks_like_short_gap_value(text: str) -> bool:
+    """Короткий ответ на «укажите адрес/город» после проверки пустых полей."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 70:
+        return False
+    lowered = raw.lower()
+    if looks_like_chitchat(raw) or looks_like_apply_pending(raw):
+        return False
+    if any(
+        k in lowered
+        for k in (
+            "?",
+            "что ",
+            "как ",
+            "почему",
+            "замени",
+            "переверн",
+            "напиши",
+            "создай",
+        )
+    ):
+        return False
+    if looks_like_edit(lowered) and not any(
+        k in lowered for k in ("вставь", "добав", "заполни", "подставь")
+    ):
+        # чистое значение без глагола правки
+        pass
+    words = raw.split()
+    if len(words) > 6:
+        return False
+    return bool(re.fullmatch(r"[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё\-\s.,/]{0,68}", raw))
 
 
 def looks_like_tone(text: str) -> bool:
