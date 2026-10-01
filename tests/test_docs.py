@@ -37,9 +37,11 @@ class TestIntentRouter(unittest.TestCase):
     def setUpClass(cls) -> None:
         from llm.client import (
             classify_document_intent,
+            looks_like_apply_pending,
             looks_like_card,
             looks_like_edit,
             looks_like_fill_data,
+            looks_like_reverse_words,
             looks_like_tone,
         )
 
@@ -48,6 +50,8 @@ class TestIntentRouter(unittest.TestCase):
         cls.looks_like_edit = staticmethod(looks_like_edit)
         cls.looks_like_fill_data = staticmethod(looks_like_fill_data)
         cls.looks_like_tone = staticmethod(looks_like_tone)
+        cls.looks_like_reverse_words = staticmethod(looks_like_reverse_words)
+        cls.looks_like_apply_pending = staticmethod(looks_like_apply_pending)
 
     def _intent(self, text: str, *, has_files: bool = False) -> str:
         return str(self.classify(text, has_files=has_files)["intent"])
@@ -165,6 +169,26 @@ class TestIntentRouter(unittest.TestCase):
         self.assertTrue(d.get("guard"))
         self.assertNotEqual(d.get("family"), "write")
 
+    def test_reverse_words_is_edit_not_fill(self) -> None:
+        phrases = [
+            "Перепиши слова задом наперёд",
+            "Нужно перевернуть все слова в файле и скинуть мне его",
+            "файл мне дай с перевёрнутыми словами",
+        ]
+        for text in phrases:
+            with self.subTest(text=text):
+                self.assertTrue(self.looks_like_reverse_words(text), msg=text)
+                d = self.classify(text, has_files=True)
+                self.assertEqual(d["intent"], "edit", msg=d)
+                self.assertNotEqual(d.get("mode"), "fill", msg=d)
+
+    def test_apply_pending_phrases(self) -> None:
+        for text in ("Давай", "Ну ты мне файл дай", "скинь файл", "примени"):
+            with self.subTest(text=text):
+                self.assertTrue(self.looks_like_apply_pending(text), msg=text)
+        self.assertFalse(self.looks_like_apply_pending("год должен быть 9991"))
+        self.assertFalse(self.looks_like_apply_pending("Замени Иванова на Петрова"))
+
 
 class TestPersonFacts(unittest.TestCase):
     @classmethod
@@ -264,6 +288,37 @@ class TestDocxWriter(unittest.TestCase):
             text_doc = Document(str(text_path))
             self.assertGreaterEqual(len([p for p in form_doc.paragraphs if p.text.strip()]), 2)
             self.assertGreaterEqual(len([p for p in text_doc.paragraphs if p.text.strip()]), 2)
+
+
+class TestReverseWords(unittest.TestCase):
+    def test_reverse_words_in_text(self) -> None:
+        from edit.docx_patch import reverse_words_in_text
+
+        self.assertEqual(
+            reverse_words_in_text("ФИО: Чикасов Денис Год: 1999"),
+            "ОИФ: восакиЧ синеД доГ: 9991",
+        )
+
+    def test_reverse_words_docx(self) -> None:
+        from docx import Document
+        from edit.docx_patch import reverse_words_docx, write_structured_docx
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.docx"
+            dest = Path(tmp) / "out.docx"
+            write_structured_docx(
+                src,
+                title="Титульный лист",
+                sections=[{"heading": None, "paragraphs": ["Год: 1999"]}],
+                doc_type="титульный",
+                layout="form",
+            )
+            result = reverse_words_docx(src, dest)
+            self.assertTrue(dest.exists())
+            self.assertGreater(int(result["changed"]), 0)
+            blob = "\n".join(p.text for p in Document(str(dest)).paragraphs)
+            self.assertIn("9991", blob)
+            self.assertNotIn("1999", blob)
 
 
 class TestUiWiring(unittest.TestCase):

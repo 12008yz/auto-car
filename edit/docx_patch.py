@@ -54,6 +54,41 @@ def _walk_paragraphs(doc: Document):
         yield from section.footer.paragraphs
 
 
+_WORD_TOKEN = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
+
+
+def reverse_words_in_text(text: str) -> str:
+    """Переворачивает каждое слово задом наперёд, пунктуацию не трогает."""
+    return _WORD_TOKEN.sub(lambda m: m.group(0)[::-1], text or "")
+
+
+def _set_paragraph_text(paragraph: Paragraph, text: str) -> None:
+    if not paragraph.runs:
+        paragraph.add_run(text)
+        return
+    first = paragraph.runs[0]
+    for run in paragraph.runs:
+        run.text = ""
+    first.text = text
+
+
+def reverse_words_docx(src: Path, dest: Path) -> dict:
+    """Копия DOCX, где каждое слово в абзацах/таблицах развёрнуто задом наперёд."""
+    doc = Document(str(src))
+    changed = 0
+    for para in _walk_paragraphs(doc):
+        original = para.text
+        if not original.strip():
+            continue
+        updated = reverse_words_in_text(original)
+        if updated != original:
+            _set_paragraph_text(para, updated)
+            changed += 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(dest))
+    return {"path": dest, "changed": changed}
+
+
 def document_plain_text(src: Path) -> str:
     doc = Document(str(src))
     return "\n".join(p.text for p in _walk_paragraphs(doc))

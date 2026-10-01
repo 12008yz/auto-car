@@ -42,6 +42,7 @@ from docs.loaders import load_document
 from edit.docx_patch import (
     apply_patches,
     filter_valid_patches,
+    reverse_words_docx,
     suggest_filename,
     write_rewrite_docx,
     write_structured_docx,
@@ -57,9 +58,11 @@ from llm.client import (
     format_by_sample,
     generate_document,
     generate_product_photo,
+    looks_like_apply_pending,
     looks_like_card,
     looks_like_edit,
     looks_like_fill_data,
+    looks_like_reverse_words,
     looks_like_tone,
     make_product_card,
     plan_edits,
@@ -257,6 +260,45 @@ def _format_citations(citations: object) -> str:
     if not lines:
         return ""
     return "\n\nИсточники:\n" + "\n".join(lines[:8])
+
+
+def _unique_edited_path(dest_dir: Path, source: Path) -> Path:
+    stem = source.stem or "document"
+    dest = dest_dir / f"{stem}_edited.docx"
+    n = 1
+    while dest.exists():
+        dest = dest_dir / f"{stem}_edited_{n}.docx"
+        n += 1
+    return dest
+
+
+async def _materialize_pending(session: UserSession) -> tuple[Path | None, str]:
+    """Сохраняет черновик правок в новый .docx и делает его активным файлом."""
+    dest_dir = session.user_dir(DATA_DIR)
+    try:
+        async with session.lock:
+            pending = session.pending
+            if pending is None:
+                return None, "Нет черновика правок"
+            session.pending = None
+            dest = _unique_edited_path(dest_dir, pending.source)
+            if pending.kind == "patch":
+                result = await asyncio.to_thread(
+                    apply_patches, pending.source, dest, pending.patches
+                )
+                note = f"Применено замен: {len(result['applied'])}."
+                if result["missing"]:
+                    note += " Не найдено: " + "; ".join(result["missing"][:5])
+            elif pending.kind == "rewrite":
+                await asyncio.to_thread(write_rewrite_docx, dest, pending.rewrite_text)
+                note = "Готовый файл с новым текстом."
+            else:
+                return None, "Нечего применять."
+            await asyncio.to_thread(_ingest_path, session, dest)
+            return dest, note
+    except Exception as exc:
+        session.pending = None
+        return None, f"Не удалось сохранить правки: {exc}"
 
 
 def _edit_keyboard() -> InlineKeyboardMarkup:
@@ -891,8 +933,11 @@ async def on_document(message: Message) -> None:
     )
     caption = (message.caption or "").strip()
     if caption and not caption.startswith("/"):
-        if looks_like_edit(caption) or looks_like_fill_data(caption):
+        if looks_like_fill_data(caption):
             session.remember_doc_task("fill", caption, accumulate_facts=True)
+            await _handle_edit(message, session, caption, mode="fill")
+        elif looks_like_edit(caption) or looks_like_reverse_words(caption):
+            session.remember_doc_task("edit", caption)
             await _handle_edit(message, session, caption)
         else:
             session.remember_doc_task("ask", caption)
@@ -924,43 +969,11 @@ async def on_edit_apply(query: CallbackQuery) -> None:
     if not isinstance(query.message, Message):
         await query.answer("Нет сообщения для ответа", show_alert=True)
         return
-    dest_dir = session.user_dir(DATA_DIR)
-    note = "Готово."
-    dest: Path | None = None
-    try:
-        async with session.lock:
-            pending = session.pending
-            if pending is None:
-                await query.answer("Нет черновика правок", show_alert=True)
-                return
-            session.pending = None
-            await query.answer()
-            stem = pending.source.stem or "document"
-            dest = dest_dir / f"{stem}_edited.docx"
-            n = 1
-            while dest.exists():
-                dest = dest_dir / f"{stem}_edited_{n}.docx"
-                n += 1
-            if pending.kind == "patch":
-                result = await asyncio.to_thread(
-                    apply_patches, pending.source, dest, pending.patches
-                )
-                note = f"Применено замен: {len(result['applied'])}."
-                if result["missing"]:
-                    note += " Не найдено: " + "; ".join(result["missing"][:5])
-            elif pending.kind == "rewrite":
-                await asyncio.to_thread(write_rewrite_docx, dest, pending.rewrite_text)
-                note = "Файл переписан новым текстом."
-            else:
-                await query.message.answer("Нечего применять.")
-                return
-            await asyncio.to_thread(_ingest_path, session, dest)
-    except Exception as exc:
-        session.pending = None
-        await query.message.answer(_fit(f"Не удалось сохранить правки: {exc}"))
-        return
+    dest, note = await _materialize_pending(session)
     if dest is None:
+        await query.answer(note or "Нет черновика правок", show_alert=True)
         return
+    await query.answer()
     try:
         await query.message.edit_text(_fit(note))
     except Exception:
@@ -987,6 +1000,19 @@ async def on_text(message: Message) -> None:
             session.pending = None
             await message.answer("Правки отменены.")
             return
+        if looks_like_reverse_words(text):
+            if not await _require_files(message, session):
+                return
+            await _handle_edit(message, session, text)
+            return
+        if looks_like_apply_pending(text):
+            dest, note = await _materialize_pending(session)
+            if dest is None:
+                await message.answer(note or "Черновик правок уже неактуален.")
+                return
+            await message.answer(_fit(note))
+            await message.answer_document(FSInputFile(dest), caption=dest.name)
+            return
         if not await _require_files(message, session):
             return
         await _handle_edit(message, session, text)
@@ -997,7 +1023,7 @@ async def on_text(message: Message) -> None:
     decision = apply_document_routing_guards(decision, text=text, has_files=has_files)
     intent = str(decision.get("intent") or "none")
     edit_mode = str(decision.get("mode") or "")
-    fillish = looks_like_edit(text) or looks_like_fill_data(text)
+    fillish = looks_like_edit(text) or looks_like_fill_data(text) or looks_like_reverse_words(text)
 
     # При файлах никогда не показываем clarify «бланк/текст» — это частый косяк
     if has_files and intent == "clarify" and str(decision.get("family") or "") == "write":
@@ -1013,14 +1039,20 @@ async def on_text(message: Message) -> None:
             k in text.lower()
             for k in ("добав", "эти данн", "вставь", "заполни", "фио", "подставь")
         )
+        and not looks_like_reverse_words(text)
     ):
         fillish = True
         intent = "edit"
         edit_mode = "fill"
 
-    if looks_like_tone(text) and has_files:
+    if looks_like_tone(text) and has_files and not looks_like_reverse_words(text):
         intent = "edit"
         edit_mode = "tone"
+
+    if looks_like_reverse_words(text) and has_files:
+        intent = "edit"
+        edit_mode = "edit"
+        fillish = True
 
     # Документная задача сильнее залипшего card_mode
     if intent in {
@@ -1091,7 +1123,9 @@ async def on_text(message: Message) -> None:
             if not await _require_files(message, session):
                 return
             mode = "auto"
-            if edit_mode == "fill" or looks_like_fill_data(text):
+            if looks_like_reverse_words(text):
+                mode = "auto"
+            elif edit_mode == "fill" or looks_like_fill_data(text):
                 mode = "fill"
             elif edit_mode == "tone" or looks_like_tone(text):
                 mode = "tone"
@@ -1386,9 +1420,10 @@ async def _make_card(
 
 
 async def _handle_question(message: Message, session: UserSession, text: str) -> None:
-    # Если это всё же заполнение — не ищем «Чикасова в файле»
-    if looks_like_fill_data(text) or looks_like_edit(text):
-        await _handle_edit(message, session, text, mode="fill")
+    # Если это правка — не отвечаем текстом «это бланк», а правим файл
+    if looks_like_reverse_words(text) or looks_like_edit(text) or looks_like_fill_data(text):
+        mode = "fill" if looks_like_fill_data(text) and not looks_like_reverse_words(text) else "auto"
+        await _handle_edit(message, session, text, mode=mode)
         return
     charge = await _require_quota(message, "ask")
     if charge is None:
@@ -1629,7 +1664,35 @@ async def _handle_edit(
         )
         return
 
-    fill_mode = mode == "fill" or looks_like_fill_data(text)
+    if looks_like_reverse_words(text):
+        charge = await _require_quota(message, "edit")
+        if charge is None:
+            return
+        status = await message.answer("Переворачиваю слова в файле…")
+        dest = _unique_edited_path(session.user_dir(DATA_DIR), active)
+        try:
+            result = await asyncio.to_thread(reverse_words_docx, active, dest)
+            async with session.lock:
+                session.pending = None
+                await asyncio.to_thread(_ingest_path, session, dest)
+        except Exception as exc:
+            _refund(message, charge, "edit")
+            await status.edit_text(_fit(f"Не удалось перевернуть слова: {exc}"))
+            return
+        session.remember_doc_task("edit", text)
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await message.answer(
+            f"Готово: перевернул слова в {int(result.get('changed') or 0)} абзацах."
+        )
+        await message.answer_document(FSInputFile(dest), caption=dest.name)
+        return
+
+    fill_mode = (mode == "fill" or looks_like_fill_data(text)) and not looks_like_reverse_words(
+        text
+    )
     tone_mode = mode == "tone" or looks_like_tone(text)
     if fill_mode:
         session.remember_doc_task("fill", text, accumulate_facts=True)

@@ -324,10 +324,6 @@ def ask_document(question: str, hits: list[Hit]) -> dict[str, Any]:
     system = (
         "Ты помощник по документам. Отвечай только на основе фрагментов. "
         "Если данных нет — так и скажи. Ответ на русском, кратко и по делу.\n"
-        "Важно: если пользователь просит ДОБАВИТЬ / ВСТАВИТЬ / ЗАПОЛНИТЬ данные в файл — "
-        "это НЕ вопрос на поиск. Ответь одной фразой, что это задача на правку бланка, "
-        "и предложи написать «добавь данные …» или нажать правку — "
-        "не делай вид, что искал ФИО в тексте.\n"
         "Верни JSON: {\"answer\": str, \"citations\": [{\"file\": str, \"location\": str, \"quote\": str}]}. "
         "quote — короткая цитата из фрагмента (до 240 символов)."
     )
@@ -645,19 +641,23 @@ def plan_edits(
 ) -> dict[str, Any]:
     mode = (mode or "auto").strip().lower()
     instr_l = (instruction or "").lower()
-    is_fill = mode == "fill" or any(
-        k in instr_l
-        for k in (
-            "добав",
-            "заполни",
-            "вставь данн",
-            "подставь",
-            "внеси данн",
-            "фио",
-            "мои данн",
-            "эти данн",
-            "данные про",
-            "в файле нужно",
+    is_transform = looks_like_reverse_words(instr_l)
+    is_fill = (not is_transform) and (
+        mode == "fill"
+        or any(
+            k in instr_l
+            for k in (
+                "добав",
+                "заполни",
+                "вставь данн",
+                "подставь",
+                "внеси данн",
+                "фио",
+                "мои данн",
+                "эти данн",
+                "данные про",
+                "в файле нужно",
+            )
         )
     )
     is_tone = mode == "tone" or looks_like_tone(instr_l)
@@ -749,11 +749,21 @@ def plan_edits(
             patches.append({"find": find, "replace": replace})
     if is_fill and patches:
         patches = _sanitize_fill_patches(patches, facts, hits_blob)
-    wants_full = any(
+    wants_full = is_transform or any(
         k in instr_l
-        for k in ("перепиши весь", "переписать весь", "заново", "с нуля", "полный текст")
+        for k in (
+            "перепиши весь",
+            "переписать весь",
+            "заново",
+            "с нуля",
+            "полный текст",
+            "все слова",
+            "каждое слово",
+        )
     )
-    if kind == "rewrite" and patches and not wants_full:
+    if is_transform:
+        kind = "rewrite"
+    elif kind == "rewrite" and patches and not wants_full:
         kind = "patch"
     if kind == "patch" and not patches:
         kind = "none"
@@ -796,6 +806,11 @@ def looks_like_edit(text: str) -> bool:
         "удалить",
         "перепиши",
         "переписать",
+        "переверн",
+        "переверт",
+        "задом наперёд",
+        "задом наперед",
+        "наоборот",
         "сократи",
         "переведи",
         "вставь",
@@ -817,6 +832,87 @@ def looks_like_edit(text: str) -> bool:
         "rewrite",
     )
     return any(k in lowered for k in keys)
+
+
+def looks_like_reverse_words(text: str) -> bool:
+    """«Переверни все слова задом наперёд» — правка файла, не заполнение бланка."""
+    lowered = (text or "").lower()
+    if any(
+        k in lowered
+        for k in (
+            "задом наперёд",
+            "задом наперед",
+            "задом-наперёд",
+            "задом-наперед",
+            "слова наоборот",
+            "наоборот слова",
+            "перевёрнут",
+            "перевернут",
+        )
+    ):
+        return True
+    if any(k in lowered for k in ("переверн", "переверт")) and any(
+        k in lowered for k in ("слов", "текст", "файл", "документ", "всё", "все")
+    ):
+        return True
+    return False
+
+
+def looks_like_apply_pending(text: str) -> bool:
+    """Пользователь просит отдать уже подготовленный файл, а не новую правку."""
+    lowered = re.sub(r"[.!?…]+$", "", (text or "").strip().lower()).strip()
+    if not lowered:
+        return False
+    if lowered in {
+        "да",
+        "давай",
+        "ок",
+        "окей",
+        "ok",
+        "okay",
+        "yes",
+        "ага",
+        "угу",
+        "примени",
+        "применить",
+        "скинь",
+        "отправь",
+        "пришли",
+        "вышли",
+        "дай",
+        "давай файл",
+        "дай файл",
+        "скинь файл",
+        "пришли файл",
+    }:
+        return True
+    if looks_like_fill_data(lowered):
+        return False
+    # «год должен быть» / точечная новая правка — не подтверждение
+    if any(
+        k in lowered
+        for k in ("замени", "добав", "заполни", "год должен", "исправ", "убери", "удали")
+    ):
+        return False
+    return any(
+        k in lowered
+        for k in (
+            "дай файл",
+            "файл дай",
+            "мне файл",
+            "файл мне",
+            "скинь файл",
+            "скинь его",
+            "скинь мне",
+            "скинуть",
+            "пришли файл",
+            "отправь файл",
+            "вышли файл",
+            "дай его",
+            "примени изменен",
+            "готовый файл",
+        )
+    )
 
 
 def looks_like_fill_data(text: str) -> bool:
@@ -1230,6 +1326,11 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
         "удалить",
         "перепиши",
         "переписать",
+        "переверн",
+        "переверт",
+        "задом наперёд",
+        "задом наперед",
+        "наоборот",
         "сократи",
         "переведи",
         "вставь",
@@ -1254,13 +1355,18 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
     has_form = any(k in lowered for k in form_keys)
     has_text = any(k in lowered for k in text_keys)
     has_write_verb = any(v in lowered for v in write_verbs)
-    has_edit = any(k in lowered for k in edit_keys) or looks_like_fill_data(lowered)
+    has_edit = (
+        any(k in lowered for k in edit_keys)
+        or looks_like_fill_data(lowered)
+        or looks_like_reverse_words(lowered)
+    )
     has_tone = looks_like_tone(lowered)
 
     # При загруженном файле правка/заполнение — не новый документ и не «поиск»
     if has_files and has_edit:
-        fill = looks_like_fill_data(lowered) or any(
-            k in lowered for k in ("добав", "заполни", "фио", "эти данн", "мои данн")
+        fill = (not looks_like_reverse_words(lowered)) and (
+            looks_like_fill_data(lowered)
+            or any(k in lowered for k in ("добав", "заполни", "фио", "эти данн", "мои данн"))
         )
         return {
             "intent": "edit",
