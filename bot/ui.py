@@ -115,6 +115,67 @@ def clarify_intent_keyboard(options: list[dict[str, str]]) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def soft_landing_keyboard(*, has_files: bool) -> InlineKeyboardMarkup:
+    """Кнопки, когда бот не уверен в намерении — без тупика."""
+    if has_files:
+        rows = [
+            [
+                InlineKeyboardButton(text="Ответить по файлу", callback_data="docs:go:ask"),
+                InlineKeyboardButton(text="Заполнить / вставить", callback_data="docs:go:fill"),
+            ],
+            [
+                InlineKeyboardButton(text="Поправить текст", callback_data="docs:go:edit"),
+                InlineKeyboardButton(text="Что не заполнено", callback_data="menu:gaps"),
+            ],
+            [
+                InlineKeyboardButton(text="Меню документов", callback_data="menu:docs"),
+                InlineKeyboardButton(text="« В меню", callback_data="menu:home"),
+            ],
+        ]
+    else:
+        rows = [
+            [
+                InlineKeyboardButton(text="Пришлю файл", callback_data="docs:go:need_file"),
+                InlineKeyboardButton(text="Создать документ", callback_data="docs:go:write_text"),
+            ],
+            [
+                InlineKeyboardButton(text="Документы", callback_data="menu:docs"),
+                InlineKeyboardButton(text="Карточка", callback_data="menu:card"),
+            ],
+            [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def soft_landing_text(*, has_files: bool, hint: str = "") -> str:
+    base = "Не до конца понял задачу — выберите, что сделать, или перефразируйте."
+    if hint:
+        base = f"{hint}\n\n{base}"
+    if has_files:
+        return (
+            f"{base}\n\n"
+            "Можно: ответить по тексту, заполнить поля, поправить файл "
+            "или открыть меню."
+        )
+    return (
+        f"{base}\n\n"
+        "Пришлите файл, создайте новый документ или откройте раздел «Документы»."
+    )
+
+
+def interpret_confirm_text(interpretation: str) -> str:
+    """Неявное подтверждение: как бот понял запрос (простым языком)."""
+    text = (interpretation or "").strip()
+    if not text:
+        return ""
+    # Уже готовая дружелюбная фраза
+    if text[0].isupper() and not text.lower().startswith("понял"):
+        low = text.lower()
+        if low.startswith(("сейчас", "ок", "хорошо", "смотрю", "ищу", "заполн", "правл", "сравн")):
+            return text
+    return f"Ок: {text}."
+
+
 def back_home_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

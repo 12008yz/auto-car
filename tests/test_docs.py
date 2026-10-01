@@ -448,6 +448,44 @@ class TestUiWiring(unittest.TestCase):
         self.assertTrue(ui.docs_more_examples_text())
         self.assertIn("бесплатно", ui.help_text().lower())
 
+    def test_soft_landing_keyboard(self) -> None:
+        from bot import ui
+
+        with_files = {
+            btn.callback_data
+            for row in ui.soft_landing_keyboard(has_files=True).inline_keyboard
+            for btn in row
+            if btn.callback_data
+        }
+        without = {
+            btn.callback_data
+            for row in ui.soft_landing_keyboard(has_files=False).inline_keyboard
+            for btn in row
+            if btn.callback_data
+        }
+        self.assertIn("docs:go:ask", with_files)
+        self.assertIn("docs:go:fill", with_files)
+        self.assertIn("docs:go:need_file", without)
+        self.assertTrue(ui.interpret_confirm_text("тест").startswith("Ок:"))
+        self.assertEqual(
+            ui.interpret_confirm_text("Сейчас посмотрю в файле…"),
+            "Сейчас посмотрю в файле…",
+        )
+        self.assertIn("Не до конца понял", ui.soft_landing_text(has_files=True))
+
+        from bot.handlers import _format_citations
+
+        cites = _format_citations(
+            [
+                {"file": "a.docx", "location": "абзац 8", "quote": "Общие сведения"},
+                {"file": "b.docx", "location": "абзац 8", "quote": "Общие сведения"},
+                {"file": "a.docx", "location": "абзац 9", "quote": "ещё"},
+            ]
+        )
+        self.assertIn("По файлам:", cites)
+        self.assertNotIn("абзац", cites)
+        self.assertNotIn("Источники", cites)
+
 
 if __name__ == "__main__":
     unittest.main()

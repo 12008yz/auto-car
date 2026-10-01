@@ -245,23 +245,28 @@ async def _finish_status(status: Message, message: Message, text: str) -> None:
 
 
 def _format_citations(citations: object) -> str:
+    """Короткая человекочитаемая подпись к источникам (не технический лог)."""
     if not isinstance(citations, list):
         return ""
-    lines = []
+    files: list[str] = []
+    seen: set[str] = set()
     for item in citations:
         if not isinstance(item, dict):
             continue
         file_name = str(item.get("file") or "").strip()
-        location = str(item.get("location") or "").strip()
-        quote = str(item.get("quote") or "").strip()
-        bit = " / ".join(x for x in (file_name, location) if x)
-        if quote:
-            lines.append(f"— {bit}: «{quote}»" if bit else f"— «{quote}»")
-        elif bit:
-            lines.append(f"— {bit}")
-    if not lines:
+        if not file_name or file_name in seen:
+            continue
+        seen.add(file_name)
+        # Укорачиваем длинные имена
+        short = file_name if len(file_name) <= 42 else file_name[:39] + "…"
+        files.append(short)
+        if len(files) >= 3:
+            break
+    if not files:
         return ""
-    return "\n\nИсточники:\n" + "\n".join(lines[:8])
+    if len(files) == 1:
+        return f"\n\nПо файлу: {files[0]}"
+    return "\n\nПо файлам: " + "; ".join(files)
 
 
 def _unique_edited_path(dest_dir: Path, source: Path) -> Path:
@@ -363,10 +368,50 @@ async def _require_files(message: Message, session: UserSession) -> bool:
     if session.index.files:
         return True
     await message.answer(
-        "Сначала пришлите документ — или откройте раздел «Документы».",
-        reply_markup=ui.docs_inline(),
+        ui.soft_landing_text(
+            has_files=False,
+            hint="Сначала нужен документ в чате.",
+        ),
+        reply_markup=ui.soft_landing_keyboard(has_files=False),
     )
     return False
+
+
+async def _soft_landing(
+    message: Message,
+    session: UserSession,
+    *,
+    hint: str = "",
+    remember_prompt: str = "",
+) -> None:
+    """Мягкий выход без тупика: объяснение + кнопки выбора."""
+    has_files = bool(session.index.files)
+    prompt = (remember_prompt or message.text or "").strip()
+    if prompt:
+        session.pending_clarify = PendingClarify(
+            prompt=prompt,
+            options=[],
+            question=hint or "Уточните задачу",
+        )
+        session.set_clarifying()
+    await message.answer(
+        ui.soft_landing_text(has_files=has_files, hint=hint),
+        reply_markup=ui.soft_landing_keyboard(has_files=has_files),
+    )
+
+
+def _interpretation_for_edit(text: str, mode: str, transform_op: str | None = None) -> str:
+    if transform_op == "reverse_words":
+        return "Сейчас переверну слова в файле и пришлю готовый Word"
+    if transform_op == "upper_case":
+        return "Сейчас сделаю текст заглавными и пришлю файл"
+    if transform_op == "lower_case":
+        return "Сейчас сделаю текст строчными и пришлю файл"
+    if mode == "fill":
+        return "Сейчас заполню поля в бланке по вашим данным"
+    if mode == "tone":
+        return "Сейчас подправлю тон текста в файле"
+    return "Сейчас подготовлю правку файла"
 
 
 async def _require_quota(message: Message, action: Action) -> ConsumeResult | None:
@@ -1049,6 +1094,12 @@ async def on_text(message: Message) -> None:
 
     has_files = bool(session.index.files)
 
+    # Короткое «Сравни» при нескольких файлах — сразу сравнение, не «поиск по фрагментам»
+    low_only = text.lower().strip(" !.?,…")
+    if has_files and low_only in {"сравни", "сравнить", "сравнение", "diff"}:
+        await _handle_compare(message, session)
+        return
+
     # После «что не заполнено» короткое «Богородицк» = заполнение поля, не поиск
     if (
         has_files
@@ -1217,6 +1268,25 @@ async def on_text(message: Message) -> None:
             return
 
         # ask / вопрос по файлу
+        if intent in {"ask", "none"} and has_files:
+            conf = float(decision.get("confidence") or 0)
+            # Слабая уверенность или пустой intent — не угадываем молча
+            if intent == "none" or conf < 0.55:
+                await _soft_landing(
+                    message,
+                    session,
+                    hint=ui.interpret_confirm_text(
+                        f"возможно, вопрос по файлу: «{(text[:80] + '…') if len(text) > 80 else text}»"
+                    ),
+                    remember_prompt=text,
+                )
+                return
+            if not await _require_files(message, session):
+                return
+            session.remember_doc_task("ask", text)
+            await _handle_question(message, session, text)
+            return
+
         if not await _require_files(message, session):
             return
         session.remember_doc_task("ask", text)
@@ -1229,7 +1299,8 @@ async def on_text(message: Message) -> None:
             await message.answer(
                 "Для карточки нужно описание товара (хотя бы пару слов) "
                 "или фото/видео.\n"
-                "Пример: «Нужно продать керамическую кружку 300 мл»."
+                "Пример: «Нужно продать керамическую кружку 300 мл».",
+                reply_markup=ui.card_inline(),
             )
             return
         charge = await _require_quota(message, "card")
@@ -1244,9 +1315,13 @@ async def on_text(message: Message) -> None:
         await _handle_edit(message, session, text)
         return
 
-    if not await _require_files(message, session):
-        return
-    await _handle_question(message, session, text)
+    # Любой непонятный запрос — soft landing, не тупик
+    await _soft_landing(
+        message,
+        session,
+        hint="Пока не отнёс фразу ни к документам, ни к карточке.",
+        remember_prompt=text,
+    )
 
 
 @router.callback_query(F.data.startswith("docs:go:"))
@@ -1271,10 +1346,54 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
         session.pending_clarify = None
         session.flow = "idle"
         await query.message.answer(
-            "Пришлите .docx в чат, затем повторите правку.\n"
-            "Пример: «Замени Иванова на Петрова».",
+            "Пришлите файл в чат (.docx для правок), затем повторите задачу.\n"
+            "Пример: «Замени Иванова на Петрова» или «Что не заполнено?».",
             reply_markup=ui.docs_inline(),
         )
+        return
+
+    if action in {"ask", "fill", "edit"}:
+        pending = session.pending_clarify
+        prompt = (pending.prompt if pending else "") or ""
+        session.pending_clarify = None
+        session.flow = "idle"
+        if not session.index.files:
+            await query.message.answer(
+                "Сначала пришлите документ.",
+                reply_markup=ui.soft_landing_keyboard(has_files=False),
+            )
+            return
+        if action == "ask":
+            if not prompt:
+                await query.message.answer(
+                    "Напишите вопрос по файлу, например: «Что в договоре про срок?»",
+                    reply_markup=ui.docs_inline(),
+                )
+                return
+            await query.message.answer("Сейчас посмотрю в файле…")
+            await _handle_question(query.message, session, prompt, announce=False)
+            return
+        if action == "fill":
+            tip = (
+                f"Ок, заполняю по вашей фразе.\n«{prompt}»"
+                if prompt
+                else "Напишите данные для полей, например: «Богородицк» или «ФИО: …»."
+            )
+            if prompt:
+                await query.message.answer(ui.interpret_confirm_text("заполнить поля бланка"))
+                await _handle_edit(query.message, session, prompt, mode="fill", announce=False)
+            else:
+                await query.message.answer(tip, reply_markup=ui.docs_inline())
+            return
+        # edit
+        if prompt:
+            await query.message.answer(ui.interpret_confirm_text("правка файла"))
+            await _handle_edit(query.message, session, prompt, mode="auto", announce=False)
+        else:
+            await query.message.answer(
+                "Напишите правку, например: «Замени Иванова на Петрова».",
+                reply_markup=ui.docs_inline(),
+            )
         return
 
     pending = session.pending_clarify
@@ -1506,22 +1625,39 @@ async def _make_card(
     )
 
 
-async def _handle_question(message: Message, session: UserSession, text: str) -> None:
+async def _handle_question(
+    message: Message,
+    session: UserSession,
+    text: str,
+    *,
+    announce: bool = True,
+) -> None:
     # Если это правка / transform — не отвечаем текстом, а правим файл
     if detect_transform(text) or looks_like_reverse_words(text) or looks_like_edit(text) or looks_like_fill_data(text):
         mode = "fill" if looks_like_fill_data(text) and not detect_transform(text) else "auto"
-        await _handle_edit(message, session, text, mode=mode)
+        await _handle_edit(message, session, text, mode=mode, announce=announce)
         return
     charge = await _require_quota(message, "ask")
     if charge is None:
         return
-    status = await message.answer("Ищу в документах…")
+    if announce:
+        await message.answer("Сейчас посмотрю в файле…")
+    status = await message.answer("Читаю…")
     try:
         async with session.lock:
             hits = await asyncio.to_thread(session.index.search, text)
         if not hits:
             _refund(message, charge, "ask")
-            await status.edit_text("По этому запросу в документах ничего нет.")
+            try:
+                await status.delete()
+            except Exception:
+                pass
+            await _soft_landing(
+                message,
+                session,
+                hint="В загруженных файлах по этому запросу ничего не нашёл.",
+                remember_prompt=text,
+            )
             return
         data = await asyncio.to_thread(ask_document, text, hits)
     except Exception as exc:
@@ -1529,6 +1665,31 @@ async def _handle_question(message: Message, session: UserSession, text: str) ->
         await status.edit_text(_fit(f"Ошибка модели: {exc}"))
         return
     answer = str(data.get("answer") or "").strip() or "Пустой ответ модели."
+    # Типичный тупик «данных нет» / «это задача на правку» — предлагаем действия
+    low = answer.lower()
+    if any(
+        k in low
+        for k in (
+            "отсутств",
+            "не найден",
+            "нет в предоставлен",
+            "ничего не",
+            "не удалось найти",
+            "данных нет",
+        )
+    ):
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await message.answer(_fit(answer))
+        await _soft_landing(
+            message,
+            session,
+            hint="Возможно, нужно не искать, а вставить/поправить в файле.",
+            remember_prompt=text,
+        )
+        return
     answer += _format_citations(data.get("citations") or [])
     await _finish_status(status, message, answer)
 
@@ -1737,17 +1898,21 @@ async def _handle_edit(
     session: UserSession,
     text: str,
     mode: str = "auto",
+    *,
+    announce: bool = True,
 ) -> None:
     active = session.active_path
     if active is None:
         await message.answer(
-            "Нет активного файла. Отправьте документ или выберите его через /use."
+            "Нет активного файла. Отправьте документ или выберите его через /use.",
+            reply_markup=ui.soft_landing_keyboard(has_files=False),
         )
         return
     if active.suffix.lower() != ".docx":
         await message.answer(
             "Править с сохранением можно только .docx.\n"
-            "Задайте вопрос по тексту или пришлите Word-файл."
+            "Задайте вопрос по тексту или пришлите Word-файл.",
+            reply_markup=ui.docs_inline(),
         )
         return
 
@@ -1756,6 +1921,12 @@ async def _handle_edit(
         charge = await _require_quota(message, "edit")
         if charge is None:
             return
+        if announce:
+            await message.answer(
+                ui.interpret_confirm_text(
+                    _interpretation_for_edit(text, "auto", transform_op)
+                )
+            )
         labels = {
             "reverse_words": "Переворачиваю слова в файле…",
             "upper_case": "Делаю текст заглавными…",
@@ -1813,6 +1984,10 @@ async def _handle_edit(
     charge = await _require_quota(message, "edit")
     if charge is None:
         return
+    if announce:
+        await message.answer(
+            ui.interpret_confirm_text(_interpretation_for_edit(text, edit_mode, None))
+        )
     status = await message.answer(status_msg)
     try:
         async with session.lock:
