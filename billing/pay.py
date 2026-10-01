@@ -59,7 +59,17 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
         ]
         if info.is_pro and info.expires_at:
             lines.append(f"Pro до: {info.expires_at}")
-        if not info.is_pro:
+        if config.BILLING_OPEN_ACCESS:
+            lines.append("")
+            lines.append("<b>Тест: открытый доступ</b> — лимиты не блокируют.")
+            lines.append(
+                f"Сегодня использовано: вопросы {info.daily_ask} · "
+                f"summary {info.daily_summary} · "
+                f"карточки {info.daily_card} · "
+                f"тексты {info.daily_write}"
+            )
+            lines.append("Очистка чата баланс и попытки не сбрасывает.")
+        elif not info.is_pro:
             lines.append("")
             lines.append("<b>Сегодня (Free)</b>")
             lines.append(
@@ -78,7 +88,17 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
     ]
     if info.is_pro and info.expires_at:
         lines.append(f"Pro until: {info.expires_at}")
-    if not info.is_pro:
+    if config.BILLING_OPEN_ACCESS:
+        lines.append("")
+        lines.append("<b>Test: open access</b> — limits not enforced.")
+        lines.append(
+            f"Used today: asks {info.daily_ask} · "
+            f"summary {info.daily_summary} · "
+            f"cards {info.daily_card} · "
+            f"writes {info.daily_write}"
+        )
+        lines.append("Clear chat does not reset balance or usage.")
+    elif not info.is_pro:
         lines.append("")
         lines.append("<b>Today (Free)</b>")
         lines.append(

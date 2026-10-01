@@ -9,7 +9,7 @@ from typing import Any
 
 from billing.db import connect, init_db
 from billing.skus import ACTION_COST, FREE_DAILY, Action, Rail, get_sku
-from config import BILLING_OPEN_ACCESS
+import config as _config
 
 _lock = threading.RLock()
 _initialized = False
@@ -205,8 +205,10 @@ def get_balance(telegram_id: int, language_code: str | None = None) -> BalanceIn
 
 def consume(telegram_id: int, action: Action, language_code: str | None = None) -> ConsumeResult:
     ensure_user(telegram_id, language_code)
-    if BILLING_OPEN_ACCESS:
-        # Временно: всё бесплатно, без Pro и лимитов
+    if _config.BILLING_OPEN_ACCESS:
+        # Лимиты не блокируют, но дневные счётчики ведём — чтобы в /balance
+        # было видно использование и очистка чата их не «обнуляла» визуально.
+        _bump_daily_counter(telegram_id, action)
         return ConsumeResult(ok=True, charged="open", amount=0)
 
     cost = ACTION_COST[action]
@@ -249,13 +251,7 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
                 reason="pro_required",
                 message="Эта функция временно недоступна. /pay",
             )
-        col = {
-            "ask": "daily_ask",
-            "summary": "daily_summary",
-            "card": "daily_card",
-            "write": "daily_write",
-            "edit": "daily_write",  # общий дневной счётчик, пока нет отдельной колонки
-        }[action]
+        col = _daily_column(action)
         daily = conn.execute(
             f"SELECT {col} AS used FROM wallets WHERE telegram_id = ?",
             (telegram_id,),
@@ -279,33 +275,55 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
         return ConsumeResult(ok=True, charged="daily", amount=1)
 
 
+def _daily_column(action: Action) -> str:
+    return {
+        "ask": "daily_ask",
+        "summary": "daily_summary",
+        "card": "daily_card",
+        "write": "daily_write",
+        "edit": "daily_write",  # общий дневной счётчик, пока нет отдельной колонки
+    }[action]
+
+
+def _bump_daily_counter(telegram_id: int, action: Action) -> None:
+    """Увеличить дневной счётчик без проверки лимита (для open access)."""
+    col = _daily_column(action)
+    with _lock, connect() as conn:
+        _reset_daily_if_needed(conn, telegram_id)
+        conn.execute(
+            f"UPDATE wallets SET {col} = {col} + 1 WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        conn.commit()
+
+
 def refund_consume(
     telegram_id: int,
     result: ConsumeResult,
     action: Action | None = None,
 ) -> None:
     """Undo a successful consume when the operation failed before delivering value."""
-    if not result.ok or not result.charged or result.amount <= 0:
+    if not result.ok or not result.charged:
         return
     _ensure_init()
     with _lock, connect() as conn:
         if result.charged == "credits":
+            if result.amount <= 0:
+                return
             conn.execute(
                 "UPDATE wallets SET credits_balance = credits_balance + ? WHERE telegram_id = ?",
                 (result.amount, telegram_id),
             )
-        elif result.charged == "daily" and action in {"ask", "summary", "card", "write"}:
-            col = {
-                "ask": "daily_ask",
-                "summary": "daily_summary",
-                "card": "daily_card",
-                "write": "daily_write",
-            }[action]
+        elif result.charged in {"daily", "open"} and action is not None:
+            # open access тоже двигает дневные счётчики — откатываем при сбое
+            col = _daily_column(action)
             conn.execute(
                 f"UPDATE wallets SET {col} = CASE WHEN {col} > 0 THEN {col} - 1 ELSE 0 END "
                 "WHERE telegram_id = ?",
                 (telegram_id,),
             )
+        else:
+            return
         conn.commit()
 
 

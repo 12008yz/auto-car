@@ -246,7 +246,7 @@ def get_session(user_id: int) -> UserSession:
 
 
 def clear_user_workspace(user_id: int, data_root: Path) -> None:
-    """Сброс сессии в памяти и удаление загруженных файлов пользователя."""
+    """Сброс диалог-сессии и файлов. Кошелёк / лимиты биллинга не трогает."""
     session = get_session(user_id)
     session.reset_memory()
     try:
