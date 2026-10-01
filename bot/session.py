@@ -57,8 +57,8 @@ class UserSession:
     last_op: str = ""
     # После «что не заполнено» ждём короткое значение (город/адрес)
     awaiting_gap_fill: bool = False
-    # Недавние message_id в этом чате — для очистки ленты
-    chat_message_ids: deque[int] = field(default_factory=lambda: deque(maxlen=2000))
+    # Недавние message_id в этом чате — для очистки ленты (и SQLite)
+    chat_message_ids: deque[int] = field(default_factory=lambda: deque(maxlen=500))
 
     @property
     def active_name(self) -> str | None:
@@ -225,7 +225,23 @@ _sessions: dict[int, UserSession] = {}
 
 def get_session(user_id: int) -> UserSession:
     if user_id not in _sessions:
-        _sessions[user_id] = UserSession(user_id=user_id)
+        session = UserSession(user_id=user_id)
+        try:
+            from bot.session_store import (
+                apply_payload,
+                load_dialog_payload,
+                rebuild_index_from_disk,
+            )
+            from config import DATA_DIR
+
+            payload = load_dialog_payload(user_id)
+            if payload:
+                apply_payload(session, payload)
+                rebuild_index_from_disk(session, DATA_DIR)
+        except Exception:
+            # БД недоступна — работаем только в памяти
+            pass
+        _sessions[user_id] = session
     return _sessions[user_id]
 
 
@@ -233,6 +249,12 @@ def clear_user_workspace(user_id: int, data_root: Path) -> None:
     """Сброс сессии в памяти и удаление загруженных файлов пользователя."""
     session = get_session(user_id)
     session.reset_memory()
+    try:
+        from bot.session_store import delete_dialog_session
+
+        delete_dialog_session(user_id)
+    except Exception:
+        pass
     user_path = data_root / str(user_id)
     if user_path.exists() and user_path.is_dir():
         shutil.rmtree(user_path, ignore_errors=True)

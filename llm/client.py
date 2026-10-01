@@ -1241,16 +1241,38 @@ def looks_like_doc_question(text: str) -> bool:
     return False
 
 
+def _lazy_detect_transform(text: str) -> str | None:
+    """Ленивый импорт, чтобы не замкнуть llm.client ↔ edit.transforms."""
+    from edit.transforms import detect_transform
+
+    return detect_transform(text)
+
+
+_FACTS_FOLLOWUP_KEYS = (
+    "добав",
+    "эти данн",
+    "вставь",
+    "встав ",
+    "заполни",
+    "фио",
+    "подставь",
+    "туда",
+)
+
+
 def apply_document_routing_guards(
     decision: dict[str, Any],
     *,
     text: str,
     has_files: bool,
+    has_facts: bool = False,
+    awaiting_gap_fill: bool = False,
 ) -> dict[str, Any]:
     """
     Страховка от типичных косяков роутера.
     Главное правило: если файлы уже в чате — почти никогда не спрашиваем
     «бланк или текст?»; по умолчанию работаем с загруженным документом.
+    Единственная точка правок intent — здесь (не в on_text).
     """
     intent = str(decision.get("intent") or "none")
     family = str(decision.get("family") or "")
@@ -1261,8 +1283,54 @@ def apply_document_routing_guards(
     questionish = looks_like_doc_question(lowered)
     fillish = looks_like_fill_data(lowered) or looks_like_edit(lowered)
     toneish = looks_like_tone(lowered)
+    transform_op = _lazy_detect_transform(text) if has_files else None
 
     if has_files:
+        # 0a) После «что не заполнено» короткое значение → fill
+        if (
+            awaiting_gap_fill
+            and looks_like_short_gap_value(text)
+            and not transform_op
+        ):
+            return {
+                "intent": "gap_fill",
+                "confidence": 0.95,
+                "mode": "fill",
+                "family": "edit",
+                "guard": "gap_fill_value",
+            }
+
+        # 0b) Накопленные факты + «вставь/добавь» → fill
+        if (
+            has_facts
+            and any(k in lowered for k in _FACTS_FOLLOWUP_KEYS)
+            and not looks_like_reverse_words(lowered)
+            and not transform_op
+        ):
+            return {
+                "intent": "edit",
+                "confidence": 0.92,
+                "mode": "fill",
+                "family": "edit",
+                "guard": "facts_followup",
+            }
+
+        # 0c) Детерминированный transform → edit
+        if transform_op and intent not in {
+            "check",
+            "risks",
+            "extract",
+            "compare",
+            "format",
+        }:
+            return {
+                "intent": "edit",
+                "confidence": 0.95,
+                "mode": "edit",
+                "family": "edit",
+                "guard": f"transform:{transform_op}",
+            }
+
         # 1) Clarify create при файлах — почти всегда ошибка
         if intent == "clarify" and family == "write" and not strong:
             return {
@@ -1380,15 +1448,27 @@ def apply_document_routing_guards(
     return decision
 
 
-def classify_document_intent(text: str, *, has_files: bool = False) -> dict[str, Any]:
+def classify_document_intent(
+    text: str,
+    *,
+    has_files: bool = False,
+    has_facts: bool = False,
+    awaiting_gap_fill: bool = False,
+) -> dict[str, Any]:
     """
-    Быстрый роутер намерений + страховка apply_document_routing_guards.
+    Единственный роутер намерений (+ guards).
     intent: card | write_form | write_text | edit | ask | check | risks |
-            extract | compare | format | clarify | none
+            extract | compare | format | clarify | gap_fill | none
     """
     raw = (text or "").strip()
     decision = _classify_document_intent_raw(raw, has_files=has_files)
-    return apply_document_routing_guards(decision, text=raw, has_files=has_files)
+    return apply_document_routing_guards(
+        decision,
+        text=raw,
+        has_files=has_files,
+        has_facts=has_facts,
+        awaiting_gap_fill=awaiting_gap_fill,
+    )
 
 
 def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict[str, Any]:

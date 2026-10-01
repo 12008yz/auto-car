@@ -21,6 +21,7 @@ class TestSyntax(unittest.TestCase):
             "bot/handlers.py",
             "bot/ui.py",
             "bot/session.py",
+            "bot/session_store.py",
             "llm/client.py",
             "edit/docx_patch.py",
             "billing/service.py",
@@ -30,6 +31,12 @@ class TestSyntax(unittest.TestCase):
             path = ROOT / rel
             with self.subTest(file=rel):
                 ast.parse(path.read_text(encoding="utf-8"))
+
+    def test_handlers_exports_tone_helper(self) -> None:
+        """Регрессия: _handle_edit вызывает looks_like_tone — импорт обязателен."""
+        import bot.handlers as handlers
+
+        self.assertTrue(callable(handlers.looks_like_tone))
 
 
 class TestIntentRouter(unittest.TestCase):
@@ -53,11 +60,25 @@ class TestIntentRouter(unittest.TestCase):
         cls.looks_like_reverse_words = staticmethod(looks_like_reverse_words)
         cls.looks_like_apply_pending = staticmethod(looks_like_apply_pending)
 
-    def _intent(self, text: str, *, has_files: bool = False) -> str:
-        return str(self.classify(text, has_files=has_files)["intent"])
+    def _intent(self, text: str, *, has_files: bool = False, **kwargs) -> str:
+        return str(self.classify(text, has_files=has_files, **kwargs)["intent"])
 
-    def _mode(self, text: str, *, has_files: bool = False) -> str:
-        return str(self.classify(text, has_files=has_files).get("mode") or "")
+    def _mode(self, text: str, *, has_files: bool = False, **kwargs) -> str:
+        return str(self.classify(text, has_files=has_files, **kwargs).get("mode") or "")
+
+    def test_facts_followup_is_fill(self) -> None:
+        d = self.classify("вставь их туда", has_files=True, has_facts=True)
+        self.assertEqual(d["intent"], "edit")
+        self.assertEqual(d.get("mode"), "fill")
+        self.assertTrue(d.get("guard"))
+
+    def test_gap_fill_short_value_intent(self) -> None:
+        d = self.classify("Богородицк", has_files=True, awaiting_gap_fill=True)
+        self.assertEqual(d["intent"], "gap_fill")
+        self.assertEqual(d.get("mode"), "fill")
+
+    def test_compare_bare_word(self) -> None:
+        self.assertEqual(self._intent("Сравни", has_files=True), "compare")
 
     def test_fill_declaration_is_edit_not_card(self) -> None:
         text = (
@@ -300,6 +321,80 @@ class TestDocSession(unittest.TestCase):
         self.assertIn("Богородицк", instr)
         self.assertIn("Богородицк", session.doc_task.facts)
         self.assertEqual(session.doc_task.kind, "fill")
+
+    def test_dialog_session_persists_across_reload(self) -> None:
+        import config
+        from billing.db import init_db
+        from bot import session as session_mod
+        from bot.session import PendingEdit, UserSession
+        from bot.session_store import delete_dialog_session, load_dialog_payload, save_dialog_session
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "billing.sqlite3"
+            old_db = config.BILLING_DB_PATH
+            config.BILLING_DB_PATH = db_path
+            session_mod._sessions.clear()
+            try:
+                init_db()
+                src = Path(tmp) / "a.docx"
+                from edit.docx_patch import write_structured_docx
+
+                write_structured_docx(
+                    src,
+                    title="T",
+                    sections=[{"heading": None, "paragraphs": ["ФИО: [ФИО]"]}],
+                    doc_type="doc",
+                    layout="form",
+                )
+                s = UserSession(user_id=42)
+                s.flow = "awaiting_confirm"
+                s.last_op = "fill"
+                s.awaiting_gap_fill = False
+                s.doc_task = session_mod.DocTask(
+                    kind="fill",
+                    facts="Чикасов Денис",
+                    last_prompt="данные",
+                    gap_fields=["[адрес]"],
+                )
+                s.pending = PendingEdit(
+                    kind="fill",
+                    source=src,
+                    patches=[{"find": "[ФИО]", "replace": "Чикасов"}],
+                    summary="заполнил ФИО",
+                )
+                s.chat_message_ids.extend([10, 11, 12])
+                save_dialog_session(s)
+
+                payload = load_dialog_payload(42)
+                self.assertIsNotNone(payload)
+                self.assertEqual(payload["flow"], "awaiting_confirm")
+                self.assertIn("Чикасов", payload["doc_task"]["facts"])
+                self.assertEqual(payload["pending"]["patches"][0]["replace"], "Чикасов")
+                self.assertEqual(payload["chat_message_ids"], [10, 11, 12])
+
+                session_mod._sessions.clear()
+                restored = session_mod.get_session(42)
+                self.assertEqual(restored.flow, "awaiting_confirm")
+                self.assertEqual(restored.last_op, "fill")
+                self.assertIsNotNone(restored.pending)
+                self.assertEqual(restored.pending.patches[0]["find"], "[ФИО]")
+                self.assertIn("Чикасов", restored.doc_task.facts)
+                self.assertEqual(list(restored.chat_message_ids), [10, 11, 12])
+
+                delete_dialog_session(42)
+                session_mod._sessions.clear()
+                fresh = session_mod.get_session(42)
+                self.assertEqual(fresh.flow, "idle")
+                self.assertIsNone(fresh.pending)
+            finally:
+                config.BILLING_DB_PATH = old_db
+                session_mod._sessions.clear()
+
+    def test_unique_positive_message_ids(self) -> None:
+        from bot.handlers import _unique_positive_ids
+
+        self.assertEqual(_unique_positive_ids([3, 1, 2, 1, 0, -5]), [1, 2, 3])
+        self.assertEqual(_unique_positive_ids([]), [])
 
     def test_ingest_clears_awaiting_confirm(self) -> None:
         from bot.handlers import _ingest_path

@@ -49,7 +49,6 @@ from edit.docx_patch import (
 from edit.transforms import apply_transform, detect_transform
 from llm.client import (
     analyze_contract_risks,
-    apply_document_routing_guards,
     ask_document,
     check_document_gaps,
     classify_document_intent,
@@ -64,12 +63,12 @@ from llm.client import (
     looks_like_edit,
     looks_like_fill_data,
     looks_like_reverse_words,
-    looks_like_short_gap_value,
     looks_like_tone,
     make_product_card,
     plan_edits,
     summarize_document,
 )
+from bot.session_store import save_dialog_session
 from rag.pipeline import Hit, chunk_blocks
 
 router = Router()
@@ -92,8 +91,38 @@ class _TrackChatMessagesMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+class _PersistSessionMiddleware(BaseMiddleware):
+    """Пишет dialog session в SQLite после каждого апдейта."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        try:
+            return await handler(event, data)
+        finally:
+            user = None
+            if isinstance(event, Message):
+                user = event.from_user
+            elif isinstance(event, CallbackQuery):
+                user = event.from_user
+            if user is not None:
+                try:
+                    save_dialog_session(get_session(user.id))
+                except Exception:
+                    log.exception("Failed to persist dialog session for %s", user.id)
+
+
 router.message.middleware(_TrackChatMessagesMiddleware())
 router.callback_query.middleware(_TrackChatMessagesMiddleware())
+router.message.middleware(_PersistSessionMiddleware())
+router.callback_query.middleware(_PersistSessionMiddleware())
+
+
+def _unique_positive_ids(known_ids: Iterable[int]) -> list[int]:
+    return sorted({int(x) for x in known_ids if int(x) > 0})
 
 
 async def _delete_chat_messages(
@@ -101,25 +130,12 @@ async def _delete_chat_messages(
     chat_id: int,
     *,
     known_ids: Iterable[int] = (),
-    up_to_id: int | None = None,
-    depth: int = 10_000,
 ) -> int:
-    """
-    Чистит переписку в личке: message_id от 1 до текущего.
-    Telegram не удаляет сообщения старше ~48 часов — такие id просто пропускаются.
-    """
-    known = [int(x) for x in known_ids if int(x) > 0]
-    end = int(up_to_id or 0)
-    if known:
-        end = max(end, max(known))
-    if end <= 0:
+    """Удаляет только известные message_id (без перебора 1..N)."""
+    ids = _unique_positive_ids(known_ids)
+    if not ids:
         return 0
 
-    start = 1
-    if depth > 0 and end - start + 1 > depth:
-        start = end - depth + 1
-
-    ids = list(range(start, end + 1))
     deleted = 0
 
     async def _delete_batch(batch: list[int]) -> int:
@@ -563,12 +579,10 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         return
     if action == "clear_yes":
         chat_id = query.message.chat.id
-        up_to = query.message.message_id
         known = list(session.chat_message_ids)
-        known.append(up_to)
+        known.append(query.message.message_id)
         try:
             await query.message.edit_text("Очищаю чат…")
-
         except Exception:
             pass
         clear_user_workspace(query.from_user.id, DATA_DIR)
@@ -576,8 +590,6 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             query.bot,
             chat_id,
             known_ids=known,
-            up_to_id=up_to,
-            depth=10_000,
         )
         sent = await query.bot.send_message(
             chat_id,
@@ -586,6 +598,10 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             reply_markup=ui.main_reply_keyboard(),
         )
         _remember_bot_message(query.from_user.id, sent)
+        try:
+            save_dialog_session(get_session(query.from_user.id))
+        except Exception:
+            pass
         return
     if action == "help":
         await query.message.answer(
@@ -1093,100 +1109,23 @@ async def on_text(message: Message) -> None:
             return
 
     has_files = bool(session.index.files)
+    has_facts = bool(session.doc_task and session.doc_task.facts)
+    decision = classify_document_intent(
+        text,
+        has_files=has_files,
+        has_facts=has_facts,
+        awaiting_gap_fill=session.awaiting_gap_fill,
+    )
+    intent = str(decision.get("intent") or "none")
+    edit_mode = str(decision.get("mode") or "")
+    transform_op = detect_transform(text)
+    conf = float(decision.get("confidence") or 0)
 
-    # Короткое «Сравни» при нескольких файлах — сразу сравнение, не «поиск по фрагментам»
-    low_only = text.lower().strip(" !.?,…")
-    if has_files and low_only in {"сравни", "сравнить", "сравнение", "diff"}:
-        await _handle_compare(message, session)
-        return
-
-    # После «что не заполнено» короткое «Богородицк» = заполнение поля, не поиск
-    if (
-        has_files
-        and session.awaiting_gap_fill
-        and looks_like_short_gap_value(text)
-        and not detect_transform(text)
-    ):
+    if intent == "gap_fill":
         session.card_mode = False
         instruction = session.gap_fill_instruction(text)
         await _handle_edit(message, session, instruction, mode="fill")
         return
-
-    # «Вставь их туда» при уже накопленных фактах / после gaps
-    if (
-        has_files
-        and (
-            looks_like_fill_data(text)
-            or (
-                session.doc_task
-                and session.doc_task.facts
-                and any(k in text.lower() for k in ("вставь", "добав", "подставь", "заполни"))
-            )
-        )
-        and not detect_transform(text)
-    ):
-        # ниже обычный edit/fill роутинг подхватит; форсируем fill
-        pass
-
-    decision = classify_document_intent(text, has_files=has_files)
-    decision = apply_document_routing_guards(decision, text=text, has_files=has_files)
-    intent = str(decision.get("intent") or "none")
-    edit_mode = str(decision.get("mode") or "")
-    transform_op = detect_transform(text)
-    fillish = (
-        looks_like_edit(text)
-        or looks_like_fill_data(text)
-        or looks_like_reverse_words(text)
-        or bool(transform_op)
-    )
-
-    # При файлах никогда не показываем clarify «бланк/текст» — это частый косяк
-    if has_files and intent == "clarify" and str(decision.get("family") or "") == "write":
-        intent = "ask"
-        decision = {**decision, "intent": "ask", "family": "ask", "guard": "handler_block_clarify"}
-    # Продолжение заполнения, если в сессии уже копили данные
-    if (
-        has_files
-        and session.doc_task
-        and session.doc_task.facts
-        and any(
-            k in text.lower()
-            for k in (
-                "добав",
-                "эти данн",
-                "вставь",
-                "встав ",
-                "заполни",
-                "фио",
-                "подставь",
-                "туда",
-            )
-        )
-        and not looks_like_reverse_words(text)
-        and not detect_transform(text)
-    ):
-        fillish = True
-        intent = "edit"
-        edit_mode = "fill"
-
-    if (
-        looks_like_tone(text)
-        and has_files
-        and not looks_like_reverse_words(text)
-        and not detect_transform(text)
-    ):
-        intent = "edit"
-        edit_mode = "tone"
-
-    if looks_like_reverse_words(text) and has_files:
-        intent = "edit"
-        edit_mode = "edit"
-        fillish = True
-
-    if transform_op and has_files:
-        intent = "edit"
-        edit_mode = "edit"
-        fillish = True
 
     # Документная задача сильнее залипшего card_mode
     if intent in {
@@ -1200,7 +1139,7 @@ async def on_text(message: Message) -> None:
         "write_form",
         "write_text",
         "clarify",
-    } or (has_files and fillish):
+    }:
         session.card_mode = False
 
         if intent == "check":
@@ -1229,7 +1168,7 @@ async def on_text(message: Message) -> None:
             await _handle_format_sample(message, session)
             return
 
-        if intent == "clarify" and not (has_files and fillish):
+        if intent == "clarify":
             options = list(decision.get("options") or [])
             question = str(decision.get("question") or "Уточните, что сделать?")
             session.pending_clarify = PendingClarify(
@@ -1245,7 +1184,7 @@ async def on_text(message: Message) -> None:
             )
             return
 
-        if intent in {"write_form", "write_text"} and not (has_files and fillish):
+        if intent in {"write_form", "write_text"}:
             mode = "form" if intent == "write_form" else "text"
             charge = await _require_quota(message, "write")
             if charge is None:
@@ -1254,7 +1193,7 @@ async def on_text(message: Message) -> None:
             await _handle_write(message, session, text, charge, mode=mode)
             return
 
-        if intent == "edit" or fillish:
+        if intent == "edit":
             if not await _require_files(message, session):
                 return
             mode = "auto"
@@ -1262,16 +1201,14 @@ async def on_text(message: Message) -> None:
                 mode = "auto"
             elif edit_mode == "fill" or looks_like_fill_data(text):
                 mode = "fill"
-            elif edit_mode == "tone" or looks_like_tone(text):
+            elif edit_mode == "tone":
                 mode = "tone"
             await _handle_edit(message, session, text, mode=mode)
             return
 
-        # ask / вопрос по файлу
-        if intent in {"ask", "none"} and has_files:
-            conf = float(decision.get("confidence") or 0)
-            # Слабая уверенность или пустой intent — не угадываем молча
-            if intent == "none" or conf < 0.55:
+        # ask
+        if intent == "ask" and has_files:
+            if conf < 0.55:
                 await _soft_landing(
                     message,
                     session,
@@ -1307,12 +1244,6 @@ async def on_text(message: Message) -> None:
         if charge is None:
             return
         await _make_card(message, session, text, None, charge)
-        return
-
-    if intent == "edit" or looks_like_edit(text):
-        if not await _require_files(message, session):
-            return
-        await _handle_edit(message, session, text)
         return
 
     # Любой непонятный запрос — soft landing, не тупик
