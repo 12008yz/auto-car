@@ -76,10 +76,12 @@ class BalanceInfo:
     daily_summary: int
     daily_card: int
     daily_write: int
+    daily_edit: int
     daily_ask_limit: int
     daily_summary_limit: int
     daily_card_limit: int
     daily_write_limit: int
+    daily_edit_limit: int
     is_pro: bool
 
 
@@ -100,7 +102,8 @@ def ensure_user(telegram_id: int, language_code: str | None = None) -> Rail:
             )
             conn.execute(
                 "INSERT INTO wallets (telegram_id, credits_balance, daily_ask, daily_summary, "
-                "daily_card, daily_write, daily_date) VALUES (?, 0, 0, 0, 0, 0, ?)",
+                "daily_card, daily_write, daily_edit, daily_date) "
+                "VALUES (?, 0, 0, 0, 0, 0, 0, ?)",
                 (telegram_id, today),
             )
             conn.execute(
@@ -146,7 +149,7 @@ def _reset_daily_if_needed(conn, telegram_id: int) -> None:
     if row["daily_date"] != today:
         conn.execute(
             "UPDATE wallets SET daily_ask = 0, daily_summary = 0, daily_card = 0, "
-            "daily_write = 0, daily_date = ? WHERE telegram_id = ?",
+            "daily_write = 0, daily_edit = 0, daily_date = ? WHERE telegram_id = ?",
             (today, telegram_id),
         )
 
@@ -176,8 +179,8 @@ def get_balance(telegram_id: int, language_code: str | None = None) -> BalanceIn
             (telegram_id,),
         ).fetchone()
         wallet = conn.execute(
-            "SELECT credits_balance, daily_ask, daily_summary, daily_card, daily_write "
-            "FROM wallets WHERE telegram_id = ?",
+            "SELECT credits_balance, daily_ask, daily_summary, daily_card, daily_write, "
+            "daily_edit FROM wallets WHERE telegram_id = ?",
             (telegram_id,),
         ).fetchone()
         sub = conn.execute(
@@ -195,10 +198,12 @@ def get_balance(telegram_id: int, language_code: str | None = None) -> BalanceIn
             daily_summary=int(wallet["daily_summary"] if wallet else 0),
             daily_card=int(wallet["daily_card"] if wallet else 0),
             daily_write=int(wallet["daily_write"] if wallet else 0),
+            daily_edit=int(wallet["daily_edit"] if wallet else 0),
             daily_ask_limit=FREE_DAILY["ask"],
             daily_summary_limit=FREE_DAILY["summary"],
             daily_card_limit=FREE_DAILY["card"],
             daily_write_limit=FREE_DAILY["write"],
+            daily_edit_limit=FREE_DAILY["edit"],
             is_pro=is_pro,
         )
 
@@ -281,7 +286,7 @@ def _daily_column(action: Action) -> str:
         "summary": "daily_summary",
         "card": "daily_card",
         "write": "daily_write",
-        "edit": "daily_write",  # общий дневной счётчик, пока нет отдельной колонки
+        "edit": "daily_edit",
     }[action]
 
 

@@ -95,8 +95,36 @@ class TestClearKeepsBilling(unittest.TestCase):
                 config.BILLING_OPEN_ACCESS = old_open
                 session_mod._sessions.clear()
 
-    def test_open_access_refund_undoes_counter(self) -> None:
-        """Сбой после consume в open access должен откатить дневной счётчик."""
+    def test_open_access_write_counts_texts_not_edits(self) -> None:
+        """Генерация текста → daily_write; правка → daily_edit."""
+        import config
+        from billing.db import init_db
+        from billing.service import consume, ensure_user, get_balance
+        from bot import session as session_mod
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "billing.sqlite3"
+            old_db = config.BILLING_DB_PATH
+            old_open = config.BILLING_OPEN_ACCESS
+            config.BILLING_DB_PATH = db_path
+            config.BILLING_OPEN_ACCESS = True
+            session_mod._sessions.clear()
+            try:
+                init_db()
+                uid = 777005
+                ensure_user(uid, "ru")
+                self.assertTrue(consume(uid, "write", "ru").ok)
+                self.assertTrue(consume(uid, "edit", "ru").ok)
+                bal = get_balance(uid, "ru")
+                self.assertEqual(bal.daily_write, 1)
+                self.assertEqual(bal.daily_edit, 1)
+            finally:
+                config.BILLING_DB_PATH = old_db
+                config.BILLING_OPEN_ACCESS = old_open
+                session_mod._sessions.clear()
+
+    def test_open_access_refund_undoes_edit_counter(self) -> None:
+        """Сбой после consume(edit) в open access откатывает daily_edit."""
         import config
         from billing.db import init_db
         from billing.service import consume, ensure_user, get_balance, refund_consume
@@ -115,9 +143,10 @@ class TestClearKeepsBilling(unittest.TestCase):
                 ensure_user(uid, "ru")
                 charge = consume(uid, "edit", "ru")
                 self.assertEqual(charge.charged, "open")
-                self.assertEqual(get_balance(uid, "ru").daily_write, 1)
-                refund_consume(uid, charge, "edit")
+                self.assertEqual(get_balance(uid, "ru").daily_edit, 1)
                 self.assertEqual(get_balance(uid, "ru").daily_write, 0)
+                refund_consume(uid, charge, "edit")
+                self.assertEqual(get_balance(uid, "ru").daily_edit, 0)
             finally:
                 config.BILLING_DB_PATH = old_db
                 config.BILLING_OPEN_ACCESS = old_open

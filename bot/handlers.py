@@ -57,6 +57,7 @@ from llm.client import (
     format_by_sample,
     generate_document,
     generate_product_photo,
+    has_strong_create,
     looks_like_apply_pending,
     looks_like_card,
     looks_like_chitchat,
@@ -65,7 +66,9 @@ from llm.client import (
     looks_like_reverse_words,
     looks_like_tone,
     make_product_card,
+    parse_document_volume,
     plan_edits,
+    refine_document_intent_llm,
     summarize_document,
 )
 from bot.session_store import save_dialog_session
@@ -304,7 +307,6 @@ async def _materialize_pending(session: UserSession) -> tuple[Path | None, str]:
             if pending is None:
                 return None, "Нет черновика правок"
             op = session.last_op or pending.kind or "edit"
-            session.pending = None
             dest = _unique_edited_path(dest_dir, pending.source)
             if pending.kind == "patch":
                 result = await asyncio.to_thread(
@@ -319,12 +321,13 @@ async def _materialize_pending(session: UserSession) -> tuple[Path | None, str]:
             else:
                 session.flow = "idle"
                 return None, "Нечего применять."
+            session.pending = None
             await asyncio.to_thread(_ingest_path, session, dest)
             session.flow = "idle"
             session.remember_op(op)
             return dest, note
     except Exception as exc:
-        session.clear_pending_flow()
+        # Черновик оставляем — пользователь может нажать «Применить» снова
         return None, f"Не удалось сохранить правки: {exc}"
 
 
@@ -383,12 +386,11 @@ def _ingest_path(session: UserSession, path: Path) -> int:
 async def _require_files(message: Message, session: UserSession) -> bool:
     if session.index.files:
         return True
-    await message.answer(
-        ui.soft_landing_text(
-            has_files=False,
-            hint="Сначала нужен документ в чате.",
-        ),
-        reply_markup=ui.soft_landing_keyboard(has_files=False),
+    await _soft_landing(
+        message,
+        session,
+        hint="Сначала нужен документ в чате.",
+        remember_prompt=(message.text or "").strip(),
     )
     return False
 
@@ -430,31 +432,46 @@ def _interpretation_for_edit(text: str, mode: str, transform_op: str | None = No
     return "Сейчас подготовлю правку файла"
 
 
-async def _require_quota(message: Message, action: Action) -> ConsumeResult | None:
-    user = message.from_user
-    if user is None:
+async def _require_quota(
+    message: Message,
+    action: Action,
+    *,
+    user: User | None = None,
+) -> ConsumeResult | None:
+    """Списать квоту. user — кто кликнул (для callback нельзя брать message.from_user = бот)."""
+    actor = user or message.from_user
+    if actor is None:
         return None
-    lang = user.language_code
-    ensure_user(user.id, lang)
-    result = consume(user.id, action, lang)
+    lang = actor.language_code
+    ensure_user(actor.id, lang)
+    result = consume(actor.id, action, lang)
     if result.ok:
         return result
     await message.answer(
         result.message or "Лимит исчерпан. /pay",
-        reply_markup=upsell_keyboard(user.id, lang),
+        reply_markup=upsell_keyboard(actor.id, lang),
     )
     return None
 
 
-def _refund(message: Message, charge: ConsumeResult | None, action: Action) -> None:
-    user = message.from_user
-    if user is None or charge is None:
+def _refund(
+    message: Message,
+    charge: ConsumeResult | None,
+    action: Action,
+    *,
+    user: User | None = None,
+) -> None:
+    actor = user or message.from_user
+    if actor is None or charge is None:
         return
-    refund_consume(user.id, charge, action)
+    refund_consume(actor.id, charge, action)
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    session = _session_of(message.from_user)
+    if session is not None:
+        session.clear_dialog_modes()
     if message.from_user:
         ensure_user(message.from_user.id, message.from_user.language_code)
     name = message.from_user.first_name if message.from_user else None
@@ -476,6 +493,9 @@ async def cmd_help(message: Message) -> None:
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message) -> None:
+    session = _session_of(message.from_user)
+    if session is not None:
+        session.clear_dialog_modes()
     await message.answer(
         ui.welcome_text(
             message.from_user.first_name if message.from_user else None
@@ -500,6 +520,7 @@ async def cmd_card(message: Message, command: CommandObject) -> None:
     session = _session_of(message.from_user)
     if session is None:
         return
+    session.clear_dialog_modes(keep_card_mode=True)
     session.card_mode = True
     notes = (command.args or "").strip()
     if notes:
@@ -522,12 +543,14 @@ async def on_menu_button(message: Message) -> None:
     if session is None:
         return
     if text == ui.BTN_HELP:
+        session.clear_dialog_modes(keep_pending=True)
         await cmd_help(message)
         return
     if text == ui.BTN_CLEAR:
         await cmd_clear(message)
         return
     if text == ui.BTN_CARD:
+        session.clear_dialog_modes(keep_card_mode=True)
         session.card_mode = True
         await message.answer(
             ui.card_prompt_text(),
@@ -536,7 +559,7 @@ async def on_menu_button(message: Message) -> None:
         )
         return
     if text == ui.BTN_DOCS:
-        session.card_mode = False
+        session.clear_dialog_modes()
         await message.answer(
             ui.docs_prompt_text(),
             parse_mode="HTML",
@@ -546,11 +569,13 @@ async def on_menu_button(message: Message) -> None:
     if text == ui.BTN_BALANCE:
         from billing.handlers import cmd_balance
 
+        session.clear_dialog_modes(keep_pending=True)
         await cmd_balance(message)
         return
     if text == ui.BTN_PLANS:
         from billing.handlers import cmd_plans
 
+        session.clear_dialog_modes(keep_pending=True)
         await cmd_plans(message)
         return
 
@@ -565,6 +590,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
     await query.answer()
 
     if action == "home":
+        session.clear_dialog_modes()
         await query.message.answer(
             ui.welcome_text(query.from_user.first_name),
             parse_mode="HTML",
@@ -604,6 +630,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             pass
         return
     if action == "help":
+        session.clear_dialog_modes(keep_pending=True)
         await query.message.answer(
             ui.help_text(),
             parse_mode="HTML",
@@ -611,6 +638,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         )
         return
     if action == "card":
+        session.clear_dialog_modes(keep_card_mode=True)
         session.card_mode = True
         await query.message.answer(
             ui.card_prompt_text(),
@@ -619,6 +647,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         )
         return
     if action == "card_example":
+        session.clear_dialog_modes(keep_card_mode=True)
         session.card_mode = True
         await query.message.answer(
             ui.card_example_text(),
@@ -627,7 +656,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         )
         return
     if action == "docs_form_ex":
-        session.card_mode = False
+        session.clear_dialog_modes()
         await query.message.answer(
             ui.docs_form_example_text(),
             parse_mode="HTML",
@@ -635,7 +664,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         )
         return
     if action == "docs_text_ex":
-        session.card_mode = False
+        session.clear_dialog_modes()
         await query.message.answer(
             ui.docs_text_example_text(),
             parse_mode="HTML",
@@ -643,7 +672,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         )
         return
     if action == "docs_fill_ex":
-        session.card_mode = False
+        session.clear_dialog_modes()
         await query.message.answer(
             ui.docs_fill_example_text(),
             parse_mode="HTML",
@@ -651,7 +680,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         )
         return
     if action == "docs_more_ex":
-        session.card_mode = False
+        session.clear_dialog_modes()
         await query.message.answer(
             ui.docs_more_examples_text(),
             parse_mode="HTML",
@@ -659,7 +688,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         )
         return
     if action == "docs":
-        session.card_mode = False
+        session.clear_dialog_modes()
         await query.message.answer(
             ui.docs_prompt_text(),
             parse_mode="HTML",
@@ -676,7 +705,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
                 reply_markup=ui.docs_inline(),
             )
             return
-        await _handle_gaps(query.message, session)
+        await _handle_gaps(query.message, session, user=query.from_user)
         return
     if action == "risks":
         if not session.index.files:
@@ -685,7 +714,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
                 reply_markup=ui.docs_inline(),
             )
             return
-        await _handle_risks(query.message, session)
+        await _handle_risks(query.message, session, user=query.from_user)
         return
     if action == "extract":
         if not session.index.files:
@@ -694,10 +723,10 @@ async def on_menu_callback(query: CallbackQuery) -> None:
                 reply_markup=ui.docs_inline(),
             )
             return
-        await _handle_extract(query.message, session)
+        await _handle_extract(query.message, session, user=query.from_user)
         return
     if action == "compare":
-        await _handle_compare(query.message, session)
+        await _handle_compare(query.message, session, user=query.from_user)
         return
     if action == "summary":
         if not session.index.files:
@@ -738,6 +767,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
     if action == "balance":
         from billing.pay import balance_text
 
+        session.clear_dialog_modes(keep_pending=True)
         ensure_user(query.from_user.id, query.from_user.language_code)
         await query.message.answer(
             balance_text(query.from_user.id, query.from_user.language_code),
@@ -749,6 +779,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         from billing.pay import pay_keyboard, plans_text
         from billing.service import get_rail
 
+        session.clear_dialog_modes(keep_pending=True)
         lang = query.from_user.language_code
         ensure_user(query.from_user.id, lang)
         rail = get_rail(query.from_user.id, lang)
@@ -992,9 +1023,8 @@ async def on_document(message: Message) -> None:
             reply_markup=ui.docs_inline(),
         )
         return
-    # Документ в чате — выходим из режима карточки, иначе следующий текст
-    # уйдёт в генерацию фото товара.
-    session.card_mode = False
+    # Документ в чате — выходим из режима карточки и залипших сценариев.
+    session.clear_dialog_modes(keep_pending=True)
     await status.edit_text(
         f"✅ <b>{escape(name)}</b> загружен\n"
         f"Фрагментов: {n_chunks}\n\n"
@@ -1066,6 +1096,59 @@ async def on_text(message: Message) -> None:
     if session is None:
         return
 
+    low = text.lower()
+
+    # Ждём тему после кнопки «Создать документ»
+    if session.flow == "awaiting_write":
+        if low in {"отмена", "cancel", "отменить", "стоп"}:
+            session.clear_dialog_modes()
+            await message.answer(
+                "Ок, создание документа отменил.",
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        if looks_like_chitchat(text) and not (
+            looks_like_edit(text) or looks_like_fill_data(text) or detect_transform(text)
+        ):
+            session.clear_dialog_modes()
+            await message.answer(
+                "Привет! Могу разобрать документ, заполнить бланк или создать Word-файл.\n"
+                "Нажмите «Документы» или пришлите файл сюда.",
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        peek = classify_document_intent(
+            text,
+            has_files=bool(session.index.files),
+            has_facts=bool(session.doc_task and session.doc_task.facts),
+            awaiting_gap_fill=False,
+        )
+        peek_intent = str(peek.get("intent") or "none")
+        if peek_intent in {
+            "ask",
+            "edit",
+            "check",
+            "risks",
+            "extract",
+            "compare",
+            "format",
+            "card",
+            "gap_fill",
+        } or (peek_intent == "clarify" and peek.get("family") != "write"):
+            session.flow = "idle"
+            session.last_op = ""
+        else:
+            session.card_mode = False
+            session.pending_clarify = None
+            mode = "form" if session.last_op == "write_form" else "text"
+            session.flow = "idle"
+            charge = await _require_quota(message, "write")
+            if charge is None:
+                return
+            session.remember_doc_task("write", text)
+            await _handle_write(message, session, text, charge, mode=mode)
+            return
+
     # Привет / small-talk — не требуем файл
     if looks_like_chitchat(text) and not (
         looks_like_edit(text) or looks_like_fill_data(text) or detect_transform(text)
@@ -1081,7 +1164,6 @@ async def on_text(message: Message) -> None:
     if session.pending is not None or session.flow == "awaiting_confirm":
         session.card_mode = False
         session.pending_clarify = None
-        low = text.lower()
         if low in {"отмена", "cancel", "отменить"}:
             session.clear_pending_flow()
             await message.answer("Правки отменены.")
@@ -1103,6 +1185,27 @@ async def on_text(message: Message) -> None:
         if session.pending is None:
             session.flow = "idle"
         else:
+            has_files_pending = bool(session.index.files)
+            decision_pending = classify_document_intent(
+                text,
+                has_files=has_files_pending,
+                has_facts=bool(session.doc_task and session.doc_task.facts),
+                awaiting_gap_fill=False,
+            )
+            intent_pending = str(decision_pending.get("intent") or "none")
+            if intent_pending in {"ask", "check", "risks", "extract", "compare"} and has_files_pending:
+                if intent_pending == "check":
+                    await _handle_gaps(message, session)
+                elif intent_pending == "risks":
+                    await _handle_risks(message, session)
+                elif intent_pending == "extract":
+                    await _handle_extract(message, session)
+                elif intent_pending == "compare":
+                    await _handle_compare(message, session)
+                else:
+                    session.remember_doc_task("ask", text)
+                    await _handle_question(message, session, text)
+                return
             if not await _require_files(message, session):
                 return
             await _handle_edit(message, session, text)
@@ -1121,8 +1224,24 @@ async def on_text(message: Message) -> None:
     transform_op = detect_transform(text)
     conf = float(decision.get("confidence") or 0)
 
+    # Сомнительная эвристика — уточняем у модели (без ломки явных паттернов)
+    if intent in {"none", ""} or (conf < 0.5 and intent not in {"gap_fill", "clarify"}):
+        try:
+            decision = await asyncio.to_thread(
+                refine_document_intent_llm,
+                text,
+                has_files=has_files,
+                heuristic=decision,
+            )
+            intent = str(decision.get("intent") or "none")
+            edit_mode = str(decision.get("mode") or "")
+            conf = float(decision.get("confidence") or 0)
+        except Exception:
+            pass
+
     if intent == "gap_fill":
         session.card_mode = False
+        session.pending_clarify = None
         instruction = session.gap_fill_instruction(text)
         await _handle_edit(message, session, instruction, mode="fill")
         return
@@ -1141,6 +1260,8 @@ async def on_text(message: Message) -> None:
         "clarify",
     }:
         session.card_mode = False
+        if intent != "clarify":
+            session.pending_clarify = None
 
         if intent == "check":
             if not await _require_files(message, session):
@@ -1186,6 +1307,23 @@ async def on_text(message: Message) -> None:
 
         if intent in {"write_form", "write_text"}:
             mode = "form" if intent == "write_form" else "text"
+            # Мягкие / неуверенные запросы — короткое «Понял так» перед генерацией
+            if (not has_strong_create(text)) or conf < 0.75:
+                label = "бланк / форму" if mode == "form" else "документ"
+                brief = (text[:120] + "…") if len(text) > 120 else text
+                session.pending_clarify = PendingClarify(
+                    prompt=text,
+                    options=[{"id": intent, "label": "Да, делай"}],
+                    question=f"создать {label}",
+                )
+                session.set_clarifying()
+                await message.answer(
+                    ui.interpret_confirm_text(f"создам {label}: «{escape(brief)}»")
+                    + "\nНажмите «Да, делай» или перефразируйте.",
+                    parse_mode="HTML",
+                    reply_markup=ui.understand_confirm_keyboard(intent),
+                )
+                return
             charge = await _require_quota(message, "write")
             if charge is None:
                 return
@@ -1265,8 +1403,7 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
     await query.answer()
 
     if action == "cancel":
-        session.pending_clarify = None
-        session.flow = "idle"
+        session.clear_dialog_modes(keep_pending=True)
         try:
             await query.message.edit_text("Ок, отменил.")
         except Exception:
@@ -1274,8 +1411,7 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
         return
 
     if action == "need_file":
-        session.pending_clarify = None
-        session.flow = "idle"
+        session.clear_dialog_modes(keep_pending=True)
         await query.message.answer(
             "Пришлите файл в чат (.docx для правок), затем повторите задачу.\n"
             "Пример: «Замени Иванова на Петрова» или «Что не заполнено?».",
@@ -1302,7 +1438,7 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
                 )
                 return
             await query.message.answer("Сейчас посмотрю в файле…")
-            await _handle_question(query.message, session, prompt, announce=False)
+            await _handle_question(query.message, session, prompt, announce=False, user=query.from_user)
             return
         if action == "fill":
             tip = (
@@ -1312,14 +1448,18 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
             )
             if prompt:
                 await query.message.answer(ui.interpret_confirm_text("заполнить поля бланка"))
-                await _handle_edit(query.message, session, prompt, mode="fill", announce=False)
+                await _handle_edit(
+                    query.message, session, prompt, mode="fill", announce=False, user=query.from_user
+                )
             else:
                 await query.message.answer(tip, reply_markup=ui.docs_inline())
             return
         # edit
         if prompt:
             await query.message.answer(ui.interpret_confirm_text("правка файла"))
-            await _handle_edit(query.message, session, prompt, mode="auto", announce=False)
+            await _handle_edit(
+                query.message, session, prompt, mode="auto", announce=False, user=query.from_user
+            )
         else:
             await query.message.answer(
                 "Напишите правку, например: «Замени Иванова на Петрова».",
@@ -1328,20 +1468,24 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
         return
 
     pending = session.pending_clarify
-    if pending is None or not pending.prompt:
-        await query.message.answer(
-            "Запрос устарел. Напишите задачу ещё раз.",
-            reply_markup=ui.docs_inline(),
-        )
-        return
-
-    prompt = pending.prompt
+    prompt = (pending.prompt if pending else "") or ""
+    # Soft landing кладёт prompt без options; clarify — с кнопками write_form/write_text.
+    from_write_clarify = bool(pending and pending.options)
     session.pending_clarify = None
     session.flow = "idle"
 
     if action in {"write_form", "write_text"}:
         mode = "form" if action == "write_form" else "text"
-        # quota через fake Message-like — используем query.message
+        # «Создать документ» / пример без темы — ждём следующее сообщение (тогда и счётчик).
+        if not prompt.strip() or not from_write_clarify:
+            session.flow = "awaiting_write"
+            session.last_op = action
+            await query.message.answer(
+                "Ок, создам документ. Напишите тему или задачу одним сообщением.\n"
+                "Пример: «Реферат на тему ИИ в медицине, 3–4 страницы».",
+                reply_markup=ui.docs_inline(),
+            )
+            return
         user = query.from_user
         ensure_user(user.id, user.language_code)
         charge = consume(user.id, "write", user.language_code)
@@ -1358,7 +1502,9 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
             )
         except Exception:
             pass
-        await _handle_write(query.message, session, prompt, charge, mode=mode)
+        await _handle_write(
+            query.message, session, prompt, charge, mode=mode, user=query.from_user
+        )
         return
 
     await query.message.answer("Не понял выбор. Напишите задачу ещё раз.")
@@ -1370,9 +1516,18 @@ async def _handle_write(
     prompt: str,
     charge: ConsumeResult,
     mode: str = "auto",
+    *,
+    user: User | None = None,
 ) -> None:
     mode = (mode or "auto").strip().lower()
-    status = await message.answer(ui.status_doc_write(mode if mode in {"form", "text"} else ""))
+    prompt = _merge_write_prompt(session, prompt)
+    volume = parse_document_volume(prompt)
+    long_job = (volume.get("pages") or 0) >= 4 and mode != "form"
+    status = await message.answer(
+        "Готовлю развёрнутый документ по разделам — это займёт пару минут…"
+        if long_job
+        else ui.status_doc_write(mode if mode in {"form", "text"} else "")
+    )
     dest_dir = session.user_dir(DATA_DIR)
     data: dict[str, Any] = {}
     dest: Path | None = None
@@ -1399,7 +1554,7 @@ async def _handle_write(
         async with session.lock:
             await asyncio.to_thread(_ingest_path, session, dest)
     except Exception as exc:
-        _refund(message, charge, "write")
+        _refund(message, charge, "write", user=user)
         await status.edit_text(_fit(f"Не удалось подготовить документ: {exc}"))
         return
     try:
@@ -1410,6 +1565,7 @@ async def _handle_write(
     title = str(data.get("title") or dest.name)
     dtype = str(data.get("doc_type") or "документ")
     used_mode = str(data.get("mode") or mode or "text")
+    session.remember_doc_task("write", prompt)
     if used_mode == "form":
         tip = (
             "Это шаблон бланка (.docx) — откройте в Word.\n"
@@ -1421,10 +1577,57 @@ async def _handle_write(
             "Это Word (.docx) — откройте в Word / LibreOffice / Google Документах.\n"
             "Текст сгенерирован заново. Учебные работы лучше проверить антиплагиатом вуза."
         )
+        approx = int(data.get("approx_chars") or 0)
+        if approx:
+            tip += f"\nОриентировочный объём: ~{approx} знаков"
+            if approx >= 1500:
+                tip += f" (~{max(1, approx // 1800)} стр.)"
+        note = str(data.get("volume_note") or "").strip()
+        if note:
+            tip += f"\n{note}"
+        if data.get("want_pdf"):
+            tip += (
+                "\nPDF пока не отдаю автоматически — скачайте .docx "
+                "или «Сохранить как PDF» в Word/Google Документах."
+            )
     await message.answer_document(
         FSInputFile(dest),
         caption=_fit(f"{title}\nТип: {dtype}\n{tip}"),
     )
+
+
+def _merge_write_prompt(session: UserSession, prompt: str) -> str:
+    """Если новое сообщение — только объём/формат, подмешиваем прошлую тему."""
+    text = (prompt or "").strip()
+    if not text:
+        return text
+    task = session.doc_task
+    prev = (task.last_prompt if task and task.kind == "write" else "") or ""
+    if not prev or prev.strip().lower() == text.lower():
+        return text
+    low = text.lower()
+    volume_only = bool(
+        re.search(r"\d+\s*(?:страниц\w*|стр\.?|знак)", low)
+    ) and not any(
+        k in low
+        for k in (
+            "тем",
+            "про ",
+            "о влиян",
+            "на тему",
+            "по теме",
+            "психолог",
+            "договор",
+            "претенз",
+            "письм",
+        )
+    )
+    short_followup = len(text) < 80 and any(
+        k in low for k in ("подлиннее", "длиннее", "больше объём", "побольше", "pdf", "пдф")
+    )
+    if volume_only or short_followup:
+        return f"{prev.strip()}\n\nУточнение объёма/формата: {text}"
+    return text
 
 
 async def _make_card(
@@ -1562,13 +1765,14 @@ async def _handle_question(
     text: str,
     *,
     announce: bool = True,
+    user: User | None = None,
 ) -> None:
     # Если это правка / transform — не отвечаем текстом, а правим файл
     if detect_transform(text) or looks_like_reverse_words(text) or looks_like_edit(text) or looks_like_fill_data(text):
         mode = "fill" if looks_like_fill_data(text) and not detect_transform(text) else "auto"
-        await _handle_edit(message, session, text, mode=mode, announce=announce)
+        await _handle_edit(message, session, text, mode=mode, announce=announce, user=user)
         return
-    charge = await _require_quota(message, "ask")
+    charge = await _require_quota(message, "ask", user=user)
     if charge is None:
         return
     if announce:
@@ -1578,7 +1782,7 @@ async def _handle_question(
         async with session.lock:
             hits = await asyncio.to_thread(session.index.search, text)
         if not hits:
-            _refund(message, charge, "ask")
+            _refund(message, charge, "ask", user=user)
             try:
                 await status.delete()
             except Exception:
@@ -1592,7 +1796,7 @@ async def _handle_question(
             return
         data = await asyncio.to_thread(ask_document, text, hits)
     except Exception as exc:
-        _refund(message, charge, "ask")
+        _refund(message, charge, "ask", user=user)
         await status.edit_text(_fit(f"Ошибка модели: {exc}"))
         return
     answer = str(data.get("answer") or "").strip() or "Пустой ответ модели."
@@ -1609,6 +1813,7 @@ async def _handle_question(
             "данных нет",
         )
     ):
+        _refund(message, charge, "ask", user=user)
         try:
             await status.delete()
         except Exception:
@@ -1625,8 +1830,10 @@ async def _handle_question(
     await _finish_status(status, message, answer)
 
 
-async def _handle_gaps(message: Message, session: UserSession) -> None:
-    charge = await _require_quota(message, "ask")
+async def _handle_gaps(
+    message: Message, session: UserSession, *, user: User | None = None
+) -> None:
+    charge = await _require_quota(message, "ask", user=user)
     if charge is None:
         return
     status = await message.answer("Смотрю, какие поля ещё пустые…")
@@ -1634,20 +1841,22 @@ async def _handle_gaps(message: Message, session: UserSession) -> None:
         async with session.lock:
             chunks = session.index.preview_chunks(20)
         if not chunks:
-            _refund(message, charge, "ask")
+            _refund(message, charge, "ask", user=user)
             await status.edit_text("В загруженных файлах нет текста.")
             return
         text = await asyncio.to_thread(check_document_gaps, chunks)
     except Exception as exc:
-        _refund(message, charge, "ask")
+        _refund(message, charge, "ask", user=user)
         await status.edit_text(_fit(f"Не удалось проверить поля: {exc}"))
         return
     session.remember_gaps(text)
     await _finish_status(status, message, text)
 
 
-async def _handle_risks(message: Message, session: UserSession) -> None:
-    charge = await _require_quota(message, "ask")
+async def _handle_risks(
+    message: Message, session: UserSession, *, user: User | None = None
+) -> None:
+    charge = await _require_quota(message, "ask", user=user)
     if charge is None:
         return
     status = await message.answer("Разбираю договор на риски…")
@@ -1655,20 +1864,22 @@ async def _handle_risks(message: Message, session: UserSession) -> None:
         async with session.lock:
             chunks = _chunks_for_active(session, limit=24)
         if not chunks:
-            _refund(message, charge, "ask")
+            _refund(message, charge, "ask", user=user)
             await status.edit_text("В файле нет текста.")
             return
         text = await asyncio.to_thread(analyze_contract_risks, chunks)
     except Exception as exc:
-        _refund(message, charge, "ask")
+        _refund(message, charge, "ask", user=user)
         await status.edit_text(_fit(f"Не удалось разобрать договор: {exc}"))
         return
     session.remember_doc_task("ask", "риски договора")
     await _finish_status(status, message, text)
 
 
-async def _handle_extract(message: Message, session: UserSession) -> None:
-    charge = await _require_quota(message, "ask")
+async def _handle_extract(
+    message: Message, session: UserSession, *, user: User | None = None
+) -> None:
+    charge = await _require_quota(message, "ask", user=user)
     if charge is None:
         return
     status = await message.answer("Собираю стороны, даты и суммы…")
@@ -1676,12 +1887,12 @@ async def _handle_extract(message: Message, session: UserSession) -> None:
         async with session.lock:
             chunks = _chunks_for_active(session, limit=24)
         if not chunks:
-            _refund(message, charge, "ask")
+            _refund(message, charge, "ask", user=user)
             await status.edit_text("В файле нет текста.")
             return
         text = await asyncio.to_thread(extract_key_facts, chunks)
     except Exception as exc:
-        _refund(message, charge, "ask")
+        _refund(message, charge, "ask", user=user)
         await status.edit_text(_fit(f"Не удалось извлечь факты: {exc}"))
         return
     session.remember_doc_task("ask", "факты")
@@ -1709,7 +1920,9 @@ def _pick_two_files(session: UserSession) -> tuple | None:
     return files[-2], files[-1]
 
 
-async def _handle_compare(message: Message, session: UserSession) -> None:
+async def _handle_compare(
+    message: Message, session: UserSession, *, user: User | None = None
+) -> None:
     pair = _pick_two_files(session)
     if pair is None:
         await message.answer(
@@ -1720,7 +1933,7 @@ async def _handle_compare(message: Message, session: UserSession) -> None:
         )
         return
     file_a, file_b = pair
-    charge = await _require_quota(message, "ask")
+    charge = await _require_quota(message, "ask", user=user)
     if charge is None:
         return
     status = await message.answer(
@@ -1730,7 +1943,7 @@ async def _handle_compare(message: Message, session: UserSession) -> None:
         chunks_a = file_a.chunks[:: max(1, len(file_a.chunks) // 18)][:18] if file_a.chunks else []
         chunks_b = file_b.chunks[:: max(1, len(file_b.chunks) // 18)][:18] if file_b.chunks else []
         if not chunks_a or not chunks_b:
-            _refund(message, charge, "ask")
+            _refund(message, charge, "ask", user=user)
             await status.edit_text("В одном из файлов нет текста.")
             return
         text = await asyncio.to_thread(
@@ -1741,14 +1954,16 @@ async def _handle_compare(message: Message, session: UserSession) -> None:
             file_b.name,
         )
     except Exception as exc:
-        _refund(message, charge, "ask")
+        _refund(message, charge, "ask", user=user)
         await status.edit_text(_fit(f"Не удалось сравнить: {exc}"))
         return
     session.remember_doc_task("ask", "сравнение")
     await _finish_status(status, message, text)
 
 
-async def _handle_format_sample(message: Message, session: UserSession) -> None:
+async def _handle_format_sample(
+    message: Message, session: UserSession, *, user: User | None = None
+) -> None:
     pair = _pick_two_files(session)
     if pair is None:
         await message.answer(
@@ -1769,7 +1984,7 @@ async def _handle_format_sample(message: Message, session: UserSession) -> None:
             (f for f in session.index.files if f.path != content_f.path),
             sample_f,
         )
-    charge = await _require_quota(message, "write")
+    charge = await _require_quota(message, "write", user=user)
     if charge is None:
         return
     status = await message.answer(
@@ -1781,7 +1996,7 @@ async def _handle_format_sample(message: Message, session: UserSession) -> None:
         c_chunks = content_f.chunks[:: max(1, len(content_f.chunks) // 16)][:16]
         s_chunks = sample_f.chunks[:: max(1, len(sample_f.chunks) // 12)][:12]
         if not c_chunks:
-            _refund(message, charge, "write")
+            _refund(message, charge, "write", user=user)
             await status.edit_text("В файле содержания нет текста.")
             return
         data = await asyncio.to_thread(format_by_sample, c_chunks, s_chunks or c_chunks)
@@ -1806,7 +2021,7 @@ async def _handle_format_sample(message: Message, session: UserSession) -> None:
         async with session.lock:
             await asyncio.to_thread(_ingest_path, session, dest)
     except Exception as exc:
-        _refund(message, charge, "write")
+        _refund(message, charge, "write", user=user)
         await status.edit_text(_fit(f"Не удалось оформить: {exc}"))
         return
     try:
@@ -1831,6 +2046,7 @@ async def _handle_edit(
     mode: str = "auto",
     *,
     announce: bool = True,
+    user: User | None = None,
 ) -> None:
     active = session.active_path
     if active is None:
@@ -1849,7 +2065,7 @@ async def _handle_edit(
 
     transform_op = detect_transform(text)
     if transform_op:
-        charge = await _require_quota(message, "edit")
+        charge = await _require_quota(message, "edit", user=user)
         if charge is None:
             return
         if announce:
@@ -1872,7 +2088,7 @@ async def _handle_edit(
                 await asyncio.to_thread(_ingest_path, session, dest)
             session.finish_op(transform_op)
         except Exception as exc:
-            _refund(message, charge, "edit")
+            _refund(message, charge, "edit", user=user)
             await status.edit_text(_fit(f"Не удалось применить преобразование: {exc}"))
             return
         session.remember_doc_task("edit", text)
@@ -1912,7 +2128,7 @@ async def _handle_edit(
         status_msg = "Готовлю план правок…"
         edit_mode = "edit"
 
-    charge = await _require_quota(message, "edit")
+    charge = await _require_quota(message, "edit", user=user)
     if charge is None:
         return
     if announce:
@@ -1940,7 +2156,7 @@ async def _handle_edit(
                         for c in session.index.preview_chunks(12)
                     ]
         if not hits:
-            _refund(message, charge, "edit")
+            _refund(message, charge, "edit", user=user)
             await status.edit_text("В файле нет текста для правок.")
             return
         data = await asyncio.to_thread(
@@ -1952,7 +2168,7 @@ async def _handle_edit(
             edit_mode,
         )
     except Exception as exc:
-        _refund(message, charge, "edit")
+        _refund(message, charge, "edit", user=user)
         await status.edit_text(_fit(f"Ошибка модели: {exc}"))
         return
     kind = data.get("kind") or "none"
@@ -1972,7 +2188,7 @@ async def _handle_edit(
     ) or (
         kind == "rewrite" and not str(data.get("rewrite_text") or "").strip()
     ):
-        _refund(message, charge, "edit")
+        _refund(message, charge, "edit", user=user)
         summary = str(data.get("summary") or "Правки не получилось спланировать.")
         await status.edit_text(_fit(summary))
         return

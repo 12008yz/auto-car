@@ -122,6 +122,37 @@ class TestIntentRouter(unittest.TestCase):
         self.assertEqual(self._intent(text, has_files=True), "edit")
         self.assertEqual(self._mode(text, has_files=True), "tone")
 
+    def test_spravka_is_not_edit_substring(self) -> None:
+        self.assertFalse(self.looks_like_edit("Нужна справка"))
+        d = self.classify("Нужна справка", has_files=True)
+        self.assertNotEqual(d["intent"], "edit")
+
+    def test_fio_verification_is_ask_not_fill(self) -> None:
+        for text in ("Верно ли ФИО?", "Можно проверить ФИО?"):
+            with self.subTest(text=text):
+                self.assertFalse(self.looks_like_fill_data(text))
+                self.assertEqual(self._intent(text, has_files=True), "ask")
+
+    def test_past_tense_create_with_files_is_write(self) -> None:
+        text = "Мне нужно чтобы ты написал реферат про медицину"
+        self.assertEqual(self._intent(text, has_files=True), "write_text")
+
+    def test_compose_contract_is_write_or_clarify(self) -> None:
+        intent = self._intent("Составь договор", has_files=False)
+        self.assertIn(intent, {"write_form", "write_text", "clarify"})
+
+    def test_contract_question_not_write_form(self) -> None:
+        """«договор» в вопросе не должен становиться созданием бланка."""
+        d = self.classify("Что в договоре про срок оплаты?", has_files=True)
+        self.assertEqual(d["intent"], "ask")
+        self.assertNotEqual(d.get("guard"), "files_soft_write_to_ask")
+
+    def test_tone_paraphrases(self) -> None:
+        self.assertTrue(self.looks_like_tone("Можно сделать короче?"))
+        self.assertTrue(self.looks_like_tone("Упрости язык"))
+        self.assertEqual(self._intent("Можно сделать короче?", has_files=True), "edit")
+        self.assertEqual(self._mode("Можно сделать короче?", has_files=True), "tone")
+
     def test_write_and_card(self) -> None:
         self.assertEqual(
             self._intent("Напиши реферат на тему ИИ", has_files=False), "write_text"
@@ -141,6 +172,25 @@ class TestIntentRouter(unittest.TestCase):
             self._intent("Нужно продать кружку керамическую 300 мл", has_files=False),
             "card",
         )
+
+    def test_parse_document_volume_pages(self) -> None:
+        from llm.client import parse_document_volume
+
+        v = parse_document_volume("Реферат на тему ИИ. Нужен pdf файл")
+        self.assertTrue(v["want_pdf"])
+        self.assertIsNone(v["pages"])
+
+        v2 = parse_document_volume("напиши реферат на 15 страниц")
+        self.assertEqual(v2["pages"], 15)
+        self.assertEqual(v2["chars"], 15 * 1800)
+        self.assertFalse(v2["want_pdf"])
+
+        v3 = parse_document_volume("объём 8000 знаков")
+        self.assertEqual(v3["chars"], 8000)
+        self.assertGreaterEqual(v3["pages"], 4)
+
+        v4 = parse_document_volume("реферат на 10-12 страниц")
+        self.assertEqual(v4["pages"], 12)
 
     def test_replace_is_edit(self) -> None:
         self.assertEqual(
@@ -306,6 +356,47 @@ class TestDocSession(unittest.TestCase):
         session.finish_op("reverse_words")
         self.assertEqual(session.last_op, "reverse_words")
         self.assertEqual(session.flow, "idle")
+
+    def test_clear_dialog_modes(self) -> None:
+        from bot.session import PendingClarify, PendingEdit, UserSession
+        from pathlib import Path
+
+        session = UserSession(user_id=31)
+        session.flow = "awaiting_write"
+        session.last_op = "write_text"
+        session.set_clarifying()
+        session.pending_clarify = PendingClarify(prompt="x", options=[], question="?")
+        session.awaiting_gap_fill = True
+        session.card_mode = True
+        session.pending = PendingEdit(kind="patch", source=Path("x.docx"), patches=[])
+
+        session.clear_dialog_modes()
+        self.assertEqual(session.flow, "idle")
+        self.assertIsNone(session.pending_clarify)
+        self.assertFalse(session.awaiting_gap_fill)
+        self.assertFalse(session.card_mode)
+        self.assertIsNone(session.pending)
+        self.assertEqual(session.last_op, "")
+
+        session.pending = PendingEdit(kind="patch", source=Path("x.docx"), patches=[])
+        session.flow = "awaiting_confirm"
+        session.card_mode = True
+        session.clear_dialog_modes(keep_pending=True, keep_card_mode=True)
+        self.assertIsNotNone(session.pending)
+        self.assertTrue(session.card_mode)
+        self.assertEqual(session.flow, "idle")
+
+    def test_merge_write_prompt_keeps_topic_for_volume(self) -> None:
+        from bot.handlers import _merge_write_prompt
+        from bot.session import UserSession
+
+        session = UserSession(user_id=41)
+        session.remember_doc_task(
+            "write", "Реферат на тему Психология влияния. Нужен pdf файл"
+        )
+        merged = _merge_write_prompt(session, "напиши реферат на 15 страниц")
+        self.assertIn("Психология влияния", merged)
+        self.assertIn("15 страниц", merged)
 
     def test_gap_fill_followup(self) -> None:
         from bot.session import UserSession
@@ -537,6 +628,7 @@ class TestUiWiring(unittest.TestCase):
             "menu:gaps",
             "menu:docs_fill_ex",
             "menu:docs_more_ex",
+            "docs:go:write_text",
         ):
             self.assertIn(need, data)
         self.assertTrue(ui.docs_fill_example_text())
@@ -561,6 +653,7 @@ class TestUiWiring(unittest.TestCase):
         self.assertIn("docs:go:ask", with_files)
         self.assertIn("docs:go:fill", with_files)
         self.assertIn("docs:go:need_file", without)
+        self.assertIn("docs:go:write_text", without)
         self.assertTrue(ui.interpret_confirm_text("тест").startswith("Ок:"))
         self.assertEqual(
             ui.interpret_confirm_text("Сейчас посмотрю в файле…"),

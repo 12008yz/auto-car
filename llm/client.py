@@ -849,7 +849,6 @@ def looks_like_edit(text: str) -> bool:
         "вставь",
         "встав ",  # опечатка «Встав туда»
         "добав",  # добавить / добавь данные в файл
-        "правк",
         "отредактируй",
         "заполни",
         "подставь",
@@ -864,7 +863,10 @@ def looks_like_edit(text: str) -> bool:
         "replace",
         "rewrite",
     )
-    return any(k in lowered for k in keys)
+    if any(k in lowered for k in keys):
+        return True
+    # «правка/правки», но не «справка»
+    return bool(re.search(r"(?<![а-яё])правк", lowered))
 
 
 def looks_like_reverse_words(text: str) -> bool:
@@ -1026,11 +1028,25 @@ def looks_like_fill_data(text: str) -> bool:
     if ("в файле" in lowered or "в документ" in lowered) and has_add:
         return True
 
-    # «фио Чикасов Денис…»
+    # «фио Чикасов Денис…» — не «верно ли ФИО?» / «проверить ФИО»
     if re.search(r"\bфио\b", lowered) and re.search(
         r"[а-яё]{2,}\s+[а-яё]{2,}", lowered
     ):
-        return True
+        questionish = "?" in (text or "") or any(
+            k in lowered
+            for k in (
+                "верно ли",
+                "правильн ли",
+                "проверь",
+                "проверить",
+                "можно провер",
+                "какой",
+                "какое",
+                "какие",
+            )
+        )
+        if not questionish:
+            return True
 
     has_date = bool(re.search(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}", lowered))
     name_triple = bool(re.search(r"[а-яё]{3,}\s+[а-яё]{3,}\s+[а-яё]{3,}", lowered))
@@ -1136,11 +1152,13 @@ def looks_like_tone(text: str) -> bool:
         k in lowered
         for k in (
             "сделай короче",
+            "сделать короче",
             "сократи текст",
             "сократи документ",
             "официальнее",
             "более официальн",
             "проще язык",
+            "упрости язык",
             "упрости текст",
             "дружелюбнее",
             "смени тон",
@@ -1149,6 +1167,7 @@ def looks_like_tone(text: str) -> bool:
             "перепиши коротк",
             "тон письма",
             "сделай проще",
+            "сделать проще",
         )
     )
 
@@ -1162,10 +1181,13 @@ def looks_like_write(text: str) -> bool:
 _STRONG_CREATE = (
     "напиши",
     "написать",
+    "написал",
     "создай",
     "создать",
+    "создал",
     "составь",
     "составить",
+    "составил",
     "сгенерируй",
     "подготовь",
     "сформируй",
@@ -1471,6 +1493,77 @@ def classify_document_intent(
     )
 
 
+def refine_document_intent_llm(
+    text: str,
+    *,
+    has_files: bool = False,
+    heuristic: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """LLM-уточнение, когда эвристика дала none / низкую уверенность."""
+    allowed = {
+        "ask",
+        "edit",
+        "write_form",
+        "write_text",
+        "check",
+        "risks",
+        "extract",
+        "compare",
+        "format",
+        "card",
+        "clarify",
+        "none",
+    }
+    system = (
+        "Ты классификатор намерений для Telegram-бота документов и карточек товара. "
+        "Верни ТОЛЬКО JSON: "
+        '{"intent":"...","confidence":0.0-1.0,"mode":"","family":"","question":"","options":[]}. '
+        "intent один из: ask, edit, write_form, write_text, check, risks, extract, compare, "
+        "format, card, clarify, none. "
+        "mode: fill|tone|text|form|edit|sample| пусто. "
+        "Если сомневаешься между создать документ и вопросом по файлу — clarify с options "
+        '[{"id":"write_text","label":"..."},{"id":"ask","label":"..."}].'
+    )
+    user = (
+        f"has_files={has_files}\n"
+        f"heuristic={json.dumps(heuristic or {}, ensure_ascii=False)}\n"
+        f"user_text={text!r}"
+    )
+    try:
+        raw = _chat(system, user, temperature=0.0)
+        data = _extract_json(raw)
+    except Exception as exc:
+        log.warning("LLM intent refine failed: %s", exc)
+        return heuristic or {"intent": "none", "confidence": 0.0, "mode": "", "family": ""}
+
+    intent = str(data.get("intent") or "none").strip()
+    if intent not in allowed:
+        intent = "none"
+    conf = float(data.get("confidence") or 0.55)
+    conf = max(0.0, min(1.0, conf))
+    mode = str(data.get("mode") or "")
+    family = str(data.get("family") or "")
+    out: dict[str, Any] = {
+        "intent": intent,
+        "confidence": conf,
+        "mode": mode,
+        "family": family,
+        "guard": "llm_refine",
+    }
+    if intent == "clarify":
+        out["question"] = str(data.get("question") or "Уточните, что сделать?")
+        opts = data.get("options") or []
+        if isinstance(opts, list):
+            out["options"] = opts
+    return apply_document_routing_guards(
+        out,
+        text=text,
+        has_files=has_files,
+        has_facts=False,
+        awaiting_gap_fill=False,
+    )
+
+
 def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict[str, Any]:
     """Сырой эвристический роутер (без финальных guards)."""
     raw = (text or "").strip()
@@ -1519,9 +1612,14 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
     write_verbs = (
         "напиши",
         "написать",
+        "написал",
         "сделай",
         "создай",
+        "создать",
+        "создал",
         "составь",
+        "составить",
+        "составил",
         "сгенерируй",
         "подготовь",
         "сформируй",
@@ -1550,7 +1648,6 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
         "переведи",
         "вставь",
         "встав ",
-        "правк",
         "отредактируй",
         "заполни",
         "подставь",
@@ -1572,6 +1669,7 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
     has_write_verb = any(v in lowered for v in write_verbs)
     has_edit = (
         any(k in lowered for k in edit_keys)
+        or bool(re.search(r"(?<![а-яё])правк", lowered))
         or looks_like_fill_data(lowered)
         or looks_like_reverse_words(lowered)
     )
@@ -1799,6 +1897,18 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
 
     # Создание: бланк vs текст
     if has_write_verb or has_form or has_text or (mentions_file and has_write_verb):
+        # «Составь договор / акт» — создание, но слово «договор» не должно
+        # перехватывать вопросы «что в договоре?»
+        if has_write_verb and (
+            "договор" in lowered
+            or re.search(r"(?<![а-яё])акт(?![а-яё])", lowered)
+        ):
+            return {
+                "intent": "write_form",
+                "confidence": 0.85,
+                "mode": "form",
+                "family": "write",
+            }
         # Явный бланк
         if has_form and not about_topic:
             if wants_only_title or "бланк" in lowered or "шаблон" in lowered or "титульн" in lowered:
@@ -1936,15 +2046,106 @@ def looks_like_write_legacy(text: str) -> bool:
     return any(k in lowered for k in kinds) and any(v in lowered for v in verbs)
 
 
+def parse_document_volume(prompt: str) -> dict[str, Any]:
+    """
+    Достаёт желаемый объём из запроса.
+    pages — целевые страницы (или None), chars — целевые знаки (или None),
+    want_pdf — просили PDF.
+    Оценка: ~1800 знаков ≈ 1 учебная страница (14 pt).
+    """
+    raw = (prompt or "").strip()
+    lowered = raw.lower().replace("ё", "е")
+    want_pdf = bool(re.search(r"\bpdf\b|пдф", lowered))
+    pages: int | None = None
+    chars: int | None = None
+
+    m = re.search(
+        r"(?:на\s+|объ[её]м(?:ом)?\s+|примерно\s+|около\s+)?"
+        r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*(?:страниц\w*|стр\.?)\b",
+        lowered,
+    )
+    if m:
+        pages = max(int(m.group(1)), int(m.group(2)))
+    if pages is None:
+        m = re.search(
+            r"(?:на\s+|объ[её]м(?:ом)?\s+|примерно\s+|около\s+)?"
+            r"(\d{1,2})\s*(?:страниц\w*|стр\.?)\b",
+            lowered,
+        )
+        if m:
+            pages = int(m.group(1))
+    if pages is None:
+        m = re.search(r"\b(\d{1,2})\s*стр\b", lowered)
+        if m:
+            pages = int(m.group(1))
+
+    m = re.search(
+        r"(\d{1,3}(?:[ \u00a0]?\d{3})*|\d+)\s*(?:тыс\.?\s*)?знак",
+        lowered,
+    )
+    if m:
+        num = re.sub(r"\D", "", m.group(1))
+        if num:
+            chars = int(num)
+            if "тыс" in lowered[m.start() : m.end() + 8]:
+                chars *= 1000
+
+    if pages is not None:
+        pages = max(1, min(int(pages), 15))
+    if chars is not None:
+        chars = max(800, min(int(chars), 15 * 1800))
+    if pages is None and chars is not None:
+        pages = max(1, min(15, (chars + 1799) // 1800))
+    if chars is None and pages is not None:
+        chars = pages * 1800
+
+    return {
+        "pages": pages,
+        "chars": chars,
+        "want_pdf": want_pdf,
+        "chars_per_page": 1800,
+    }
+
+
+def _normalize_sections(sections_raw: Any) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    if not isinstance(sections_raw, list):
+        return sections
+    for item in sections_raw:
+        if not isinstance(item, dict):
+            continue
+        heading = str(item.get("heading") or "").strip()[:120]
+        paras_in = item.get("paragraphs") or []
+        if isinstance(paras_in, str):
+            paras_in = [paras_in]
+        paragraphs = [str(p).strip() for p in paras_in if str(p).strip()]
+        if heading or paragraphs:
+            sections.append({"heading": heading, "paragraphs": paragraphs})
+    return sections
+
+
+def _sections_char_count(sections: list[dict[str, Any]]) -> int:
+    total = 0
+    for sec in sections:
+        total += len(str(sec.get("heading") or ""))
+        for p in sec.get("paragraphs") or []:
+            total += len(str(p))
+    return total
+
+
 def generate_document(prompt: str, mode: str = "auto") -> dict[str, Any]:
     """
     Генерация документа.
     mode: auto | form | text
+    Для больших объёмов («на 15 страниц») — план + раскрытие разделов.
     """
     prompt_l = (prompt or "").lower()
     mode = (mode or "auto").strip().lower()
     if mode not in {"auto", "form", "text"}:
         mode = "auto"
+    volume = parse_document_volume(prompt)
+    target_pages = volume.get("pages")
+    target_chars = volume.get("chars")
     is_form = mode == "form" or (
         mode == "auto"
         and any(
@@ -2003,12 +2204,13 @@ def generate_document(prompt: str, mode: str = "auto") -> dict[str, Any]:
         "B) СВЯЗНЫЙ ТЕКСТ (реферат, эссе, доклад, письмо, претензия, КП)\n"
         "   Письмо / претензия / коммерческое предложение — деловой тон, чёткие блоки "
         "(адресат, суть, требования/условия, подпись).\n"
-        "   Учебный текст — 5–8 разделов / введение–заключение, своими словами, "
-        "без копипаста, можно ориентировочный список литературы.\n\n"
+        "   Учебный текст — введение, основные разделы, заключение; своими словами, "
+        "без копипаста; можно ориентировочный список литературы.\n\n"
         "Общие правила:\n"
         "• Не выдумывай чужие ФИО, ИНН, адреса — только плейсхолдеры.\n"
         "• Не выдавай шаблон за юридическую консультацию.\n"
-        "• Строго следуй объёму из запроса: «только титульный» = только титульный."
+        "• Строго следуй объёму из запроса: «только титульный» = только титульный; "
+        "«N страниц» / «N знаков» — обязательный целевой объём текста."
     )
     if mode == "form" or is_form:
         system += (
@@ -2026,7 +2228,29 @@ def generate_document(prompt: str, mode: str = "auto") -> dict[str, Any]:
             "\n\nСейчас запрос похож на БЛАНК/ТИТУЛЬНЫЙ/ФОРМУ — используй режим A, "
             "не режим B."
         )
-    user = f"Запрос пользователя:\n{(prompt or '').strip()}"
+
+    # Длинные учебные тексты — план + пораздельная генерация (один JSON редко тянет 10+ стр.)
+    long_text = (
+        not is_form
+        and target_pages is not None
+        and int(target_pages) >= 4
+    )
+    if long_text:
+        return _generate_long_document(
+            prompt,
+            target_pages=int(target_pages),
+            target_chars=int(target_chars or target_pages * 1800),
+            want_pdf=bool(volume.get("want_pdf")),
+        )
+
+    volume_line = ""
+    if target_chars:
+        volume_line = (
+            f"\nЦелевой объём: примерно {target_chars} знаков"
+            + (f" (~{target_pages} стр.)" if target_pages else "")
+            + ". Нужны развёрнутые абзацы, не краткий конспект."
+        )
+    user = f"Запрос пользователя:\n{(prompt or '').strip()}{volume_line}"
     raw = _chat(system, user, temperature=0.35 if is_form else 0.75)
     try:
         data = _extract_json(raw)
@@ -2036,19 +2260,7 @@ def generate_document(prompt: str, mode: str = "auto") -> dict[str, Any]:
     title = str(data.get("title") or "Документ").strip()[:200]
     doc_type = str(data.get("doc_type") or ("титульный" if is_form else "другое")).strip().lower()[:40]
     stem = str(data.get("filename_stem") or title).strip()[:80]
-    sections_raw = data.get("sections") or []
-    sections: list[dict[str, Any]] = []
-    if isinstance(sections_raw, list):
-        for item in sections_raw:
-            if not isinstance(item, dict):
-                continue
-            heading = str(item.get("heading") or "").strip()[:120]
-            paras_in = item.get("paragraphs") or []
-            if isinstance(paras_in, str):
-                paras_in = [paras_in]
-            paragraphs = [str(p).strip() for p in paras_in if str(p).strip()]
-            if heading or paragraphs:
-                sections.append({"heading": heading, "paragraphs": paragraphs})
+    sections = _normalize_sections(data.get("sections") or [])
     if not sections:
         raise RuntimeError("Модель вернула пустой документ")
     return {
@@ -2057,6 +2269,111 @@ def generate_document(prompt: str, mode: str = "auto") -> dict[str, Any]:
         "filename_stem": stem,
         "sections": sections,
         "mode": "form" if is_form else "text",
+        "want_pdf": bool(volume.get("want_pdf")),
+        "target_pages": target_pages,
+        "approx_chars": _sections_char_count(sections),
+    }
+
+
+def _generate_long_document(
+    prompt: str,
+    *,
+    target_pages: int,
+    target_chars: int,
+    want_pdf: bool = False,
+) -> dict[str, Any]:
+    """Реферат/доклад большого объёма: оглавление, затем текст по главам."""
+    # Практика: >12 стр. одним заходом нестабильно по времени/таймауту
+    effective_pages = max(4, min(int(target_pages), 12))
+    effective_chars = max(effective_pages * 1800, min(int(target_chars), 12 * 1800))
+    n_sections = max(6, min(12, effective_pages + 2))
+    chars_per = max(900, effective_chars // n_sections)
+
+    outline_system = (
+        "Составь план учебного документа на русском. Верни только JSON:\n"
+        '{"title":str,"doc_type":str,"filename_stem":str,'
+        '"headings":[str]}\n'
+        f"Нужно ровно {n_sections} заголовков разделов (включая введение и заключение). "
+        "Без текста абзацев — только названия разделов."
+    )
+    outline_user = (
+        f"Запрос:\n{(prompt or '').strip()}\n"
+        f"Целевой объём: ~{effective_pages} страниц (~{effective_chars} знаков)."
+    )
+    raw = _chat(outline_system, outline_user, temperature=0.4)
+    try:
+        outline = _extract_json(raw)
+    except Exception as exc:
+        raise RuntimeError(f"Не разобрать план документа: {exc}") from exc
+
+    title = str(outline.get("title") or "Реферат").strip()[:200]
+    doc_type = str(outline.get("doc_type") or "реферат").strip().lower()[:40]
+    stem = str(outline.get("filename_stem") or title).strip()[:80]
+    headings = [str(h).strip()[:120] for h in (outline.get("headings") or []) if str(h).strip()]
+    if len(headings) < 4:
+        headings = [
+            "Введение",
+            "Основная часть",
+            "Практический аспект",
+            "Заключение",
+            "Список литературы",
+        ]
+    headings = headings[:n_sections]
+    while len(headings) < n_sections:
+        headings.append(f"Раздел {len(headings)}")
+
+    sections: list[dict[str, Any]] = []
+    for heading in headings:
+        expand_system = (
+            "Напиши один раздел учебного текста на русском. Верни только JSON:\n"
+            '{"heading":str,"paragraphs":[str]}\n'
+            f"Раздел «{heading}». Нужно примерно {chars_per} знаков связного текста "
+            "(несколько абзацев по 4–8 предложений). Без воды и без копипаста. "
+            "Не повторяй другие разделы."
+        )
+        expand_user = (
+            f"Тема документа: {title}\n"
+            f"Общий запрос пользователя:\n{(prompt or '').strip()}\n"
+            f"Пиши только раздел: {heading}"
+        )
+        try:
+            part_raw = _chat(expand_system, expand_user, temperature=0.7)
+            part = _extract_json(part_raw)
+        except Exception as exc:
+            log.warning("Section expand failed for %s: %s", heading, exc)
+            part = {
+                "heading": heading,
+                "paragraphs": [
+                    f"[Не удалось полностью раскрыть раздел «{heading}». "
+                    f"Повторите запрос или уменьшите объём.]"
+                ],
+            }
+        sec_list = _normalize_sections([part])
+        if sec_list:
+            if not sec_list[0].get("heading"):
+                sec_list[0]["heading"] = heading
+            sections.extend(sec_list)
+        else:
+            sections.append({"heading": heading, "paragraphs": ["…"]})
+
+    if not sections:
+        raise RuntimeError("Не удалось собрать длинный документ")
+    note = ""
+    if target_pages > effective_pages:
+        note = (
+            f"Запросили ~{target_pages} стр., сформировал развёрнутый текст "
+            f"ориентировочно на ~{effective_pages} стр. (лимит стабильной генерации)."
+        )
+    return {
+        "title": title,
+        "doc_type": doc_type,
+        "filename_stem": stem,
+        "sections": sections,
+        "mode": "text",
+        "want_pdf": want_pdf,
+        "target_pages": target_pages,
+        "approx_chars": _sections_char_count(sections),
+        "volume_note": note,
     }
 
 

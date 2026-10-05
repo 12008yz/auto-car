@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     daily_summary INTEGER NOT NULL DEFAULT 0,
     daily_card INTEGER NOT NULL DEFAULT 0,
     daily_write INTEGER NOT NULL DEFAULT 0,
+    daily_edit INTEGER NOT NULL DEFAULT 0,
     daily_date TEXT NOT NULL
 );
 
@@ -81,5 +82,9 @@ def init_db() -> None:
         if "daily_write" not in cols:
             conn.execute(
                 "ALTER TABLE wallets ADD COLUMN daily_write INTEGER NOT NULL DEFAULT 0"
+            )
+        if "daily_edit" not in cols:
+            conn.execute(
+                "ALTER TABLE wallets ADD COLUMN daily_edit INTEGER NOT NULL DEFAULT 0"
             )
         conn.commit()

@@ -94,6 +94,11 @@ def docs_inline() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Пример бланка", callback_data="menu:docs_form_ex"),
                 InlineKeyboardButton(text="Пример текста", callback_data="menu:docs_text_ex"),
             ],
+            [
+                InlineKeyboardButton(
+                    text="Создать документ", callback_data="docs:go:write_text"
+                ),
+            ],
             [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
         ]
     )
@@ -160,6 +165,21 @@ def soft_landing_text(*, has_files: bool, hint: str = "") -> str:
     return (
         f"{base}\n\n"
         "Пришлите файл, создайте новый документ или откройте раздел «Документы»."
+    )
+
+
+def understand_confirm_keyboard(action: str) -> InlineKeyboardMarkup:
+    """Подтверждение понимания перед дорогим действием (создать документ)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Да, делай",
+                    callback_data=f"docs:go:{action}",
+                )
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="docs:go:cancel")],
+        ]
     )
 
 

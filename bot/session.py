@@ -51,7 +51,7 @@ class UserSession:
     doc_task: DocTask | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     card_mode: bool = False
-    # idle | awaiting_confirm | clarifying
+    # idle | awaiting_confirm | clarifying | awaiting_write
     flow: str = "idle"
     # fill | patch | tone | rewrite | reverse_words | ask | write | check | …
     last_op: str = ""
@@ -87,6 +87,22 @@ class UserSession:
     def clear_pending_flow(self) -> None:
         self.pending = None
         self.flow = "idle"
+
+    def clear_dialog_modes(
+        self,
+        *,
+        keep_pending: bool = False,
+        keep_card_mode: bool = False,
+    ) -> None:
+        """Сброс залипших режимов при меню / загрузке файла / смене задачи."""
+        self.flow = "idle"
+        self.pending_clarify = None
+        self.awaiting_gap_fill = False
+        self.last_op = ""
+        if not keep_card_mode:
+            self.card_mode = False
+        if not keep_pending:
+            self.pending = None
 
     def finish_op(self, op: str = "") -> None:
         self.pending = None

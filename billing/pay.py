@@ -66,7 +66,8 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
                 f"Сегодня использовано: вопросы {info.daily_ask} · "
                 f"summary {info.daily_summary} · "
                 f"карточки {info.daily_card} · "
-                f"тексты {info.daily_write}"
+                f"тексты {info.daily_write} · "
+                f"правки {info.daily_edit}"
             )
             lines.append("Очистка чата баланс и попытки не сбрасывает.")
         elif not info.is_pro:
@@ -76,7 +77,8 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
                 f"Вопросы {info.daily_ask}/{info.daily_ask_limit} · "
                 f"summary {info.daily_summary}/{info.daily_summary_limit} · "
                 f"карточки {info.daily_card}/{info.daily_card_limit} · "
-                f"тексты {info.daily_write}/{info.daily_write_limit}"
+                f"тексты {info.daily_write}/{info.daily_write_limit} · "
+                f"правки {info.daily_edit}/{info.daily_edit_limit}"
             )
         return "\n".join(lines)
     lines = [
@@ -95,7 +97,8 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
             f"Used today: asks {info.daily_ask} · "
             f"summary {info.daily_summary} · "
             f"cards {info.daily_card} · "
-            f"writes {info.daily_write}"
+            f"texts {info.daily_write} · "
+            f"edits {info.daily_edit}"
         )
         lines.append("Clear chat does not reset balance or usage.")
     elif not info.is_pro:
@@ -105,7 +108,8 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
             f"Asks {info.daily_ask}/{info.daily_ask_limit} · "
             f"summary {info.daily_summary}/{info.daily_summary_limit} · "
             f"cards {info.daily_card}/{info.daily_card_limit} · "
-            f"writes {info.daily_write}/{info.daily_write_limit}"
+            f"texts {info.daily_write}/{info.daily_write_limit} · "
+            f"edits {info.daily_edit}/{info.daily_edit_limit}"
         )
     return "\n".join(lines)
 
