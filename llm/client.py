@@ -1173,9 +1173,9 @@ def looks_like_tone(text: str) -> bool:
 
 
 def looks_like_write(text: str) -> bool:
-    """Создание документа без уточнения (бланк или текст)."""
+    """Создание документа без уточнения (бланк, текст или деловой шаблон)."""
     intent = classify_document_intent(text, has_files=False)
-    return intent["intent"] in {"write_form", "write_text"}
+    return intent["intent"] in {"write_form", "write_text", "business_write"}
 
 
 _STRONG_CREATE = (
@@ -1372,7 +1372,7 @@ def apply_document_routing_guards(
             }
 
         # 2) write_* без явного создания — вопрос/правка
-        if intent in {"write_form", "write_text"} and not strong:
+        if intent in {"write_form", "write_text", "business_write"} and not strong:
             if fillish:
                 return {
                     "intent": "edit",
@@ -1392,8 +1392,8 @@ def apply_document_routing_guards(
         # 3) Вопрос/проверка важнее создания (но не ломаем явный write с сильным глаголом)
         if (
             questionish
-            and intent in {"clarify", "write_form", "write_text", "none", "card"}
-            and not (strong and intent in {"write_form", "write_text"})
+            and intent in {"clarify", "write_form", "write_text", "business_write", "none", "card"}
+            and not (strong and intent in {"write_form", "write_text", "business_write"})
         ):
             if fillish:
                 return {
@@ -1479,7 +1479,7 @@ def classify_document_intent(
 ) -> dict[str, Any]:
     """
     Единственный роутер намерений (+ guards).
-    intent: card | write_form | write_text | edit | ask | check | risks |
+    intent: card | write_form | write_text | business_write | official_form | edit | ask | check | risks |
             extract | compare | format | clarify | gap_fill | none
     """
     raw = (text or "").strip()
@@ -1505,6 +1505,8 @@ def refine_document_intent_llm(
         "edit",
         "write_form",
         "write_text",
+        "business_write",
+        "official_form",
         "check",
         "risks",
         "extract",
@@ -1517,10 +1519,14 @@ def refine_document_intent_llm(
     system = (
         "Ты классификатор намерений для Telegram-бота документов и карточек товара. "
         "Верни ТОЛЬКО JSON: "
-        '{"intent":"...","confidence":0.0-1.0,"mode":"","family":"","question":"","options":[]}. '
-        "intent один из: ask, edit, write_form, write_text, check, risks, extract, compare, "
+        '{"intent":"...","confidence":0.0-1.0,"mode":"","family":"","question":"","options":[],'
+        '"doc_kind":""}. '
+        "intent один из: ask, edit, write_form, write_text, business_write, official_form, check, risks, extract, compare, "
         "format, card, clarify, none. "
-        "mode: fill|tone|text|form|edit|sample| пусто. "
+        "official_form — скачать/прислать официальный бланк ФНС из каталога (Р21001, УСН, патент и т.п.). "
+        "business_write — деловой черновик: договор, акт, счёт, претензия, письмо "
+        "(mode/doc_kind: contract|act|invoice|claim|letter). "
+        "mode: fill|tone|text|form|edit|sample|contract|act|invoice|claim|letter| пусто. "
         "Если сомневаешься между создать документ и вопросом по файлу — clarify с options "
         '[{"id":"write_text","label":"..."},{"id":"ask","label":"..."}].'
     )
@@ -1550,6 +1556,14 @@ def refine_document_intent_llm(
         "family": family,
         "guard": "llm_refine",
     }
+    doc_kind = str(data.get("doc_kind") or "").strip()
+    if intent == "business_write":
+        if doc_kind in {"contract", "act", "invoice", "claim", "letter"}:
+            out["doc_kind"] = doc_kind
+            if not mode:
+                out["mode"] = doc_kind
+        elif mode in {"contract", "act", "invoice", "claim", "letter"}:
+            out["doc_kind"] = mode
     if intent == "clarify":
         out["question"] = str(data.get("question") or "Уточните, что сделать?")
         opts = data.get("options") or []
@@ -1897,17 +1911,41 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
 
     # Создание: бланк vs текст
     if has_write_verb or has_form or has_text or (mentions_file and has_write_verb):
-        # «Составь договор / акт» — создание, но слово «договор» не должно
-        # перехватывать вопросы «что в договоре?»
-        if has_write_verb and (
-            "договор" in lowered
-            or re.search(r"(?<![а-яё])акт(?![а-яё])", lowered)
-        ):
+        from docs.business_types import KIND_LABELS_RU, detect_business_kind
+        from docs.official_forms import looks_like_official_form_request
+
+        # Официальный бланк ФНС — до academic write_form / business drafts
+        if looks_like_official_form_request(text, has_files=has_files):
             return {
-                "intent": "write_form",
-                "confidence": 0.85,
-                "mode": "form",
+                "intent": "official_form",
+                "confidence": 0.93,
+                "mode": "",
                 "family": "write",
+            }
+
+        biz_kind = detect_business_kind(text)
+        if biz_kind:
+            return {
+                "intent": "business_write",
+                "confidence": 0.9,
+                "mode": biz_kind,
+                "family": "write",
+                "doc_kind": biz_kind,
+            }
+        # «Нужен документ…» без типа — кнопки деловых шаблонов (не реферат/бланк ФНС)
+        if (has_write_verb or any(k in lowered for k in ("нужен", "нужна", "нужно", "хочу"))) and (
+            "документ" in lowered or "бумаг" in lowered
+        ) and not any(k in lowered for k in ("реферат", "эссе", "доклад", "сочинен", "бланк", "титульн", "декларац")):
+            return {
+                "intent": "clarify",
+                "confidence": 0.7,
+                "mode": "",
+                "family": "write",
+                "question": "Какой документ подготовить?",
+                "options": [
+                    {"id": f"biz:{k}", "label": label}
+                    for k, label in KIND_LABELS_RU.items()
+                ],
             }
         # Явный бланк
         if has_form and not about_topic:
@@ -1958,8 +1996,6 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
                     "эссе",
                     "доклад",
                     "сочинен",
-                    "претензи",
-                    "письмо",
                     "коммерческ",
                 )
             )

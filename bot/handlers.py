@@ -26,7 +26,14 @@ from billing.pay import upsell_keyboard
 from billing.service import ConsumeResult, consume, ensure_user, refund_consume
 from billing.skus import Action
 from bot.media import extract_video_frame
-from bot.session import PendingClarify, PendingEdit, UserSession, clear_user_workspace, get_session
+from bot.session import (
+    BusinessDraft,
+    PendingClarify,
+    PendingEdit,
+    UserSession,
+    clear_user_workspace,
+    get_session,
+)
 from bot import ui
 from card.prepare import prepare_fallback_cutout, prepare_studio_product
 from card.render import render_product_card_pack
@@ -39,6 +46,25 @@ from card.styles import (
 )
 from config import ALLOWED_SUFFIXES, DATA_DIR, IMAGE_SUFFIXES, MAX_FILE_BYTES, TELEGRAM_MAX_LEN
 from docs.loaders import load_document
+from docs.business_types import (
+    KIND_LABELS_RU,
+    apply_defaults,
+    detect_business_kind,
+    is_vague_user_reply,
+    kind_from_short_hint,
+    listed_business_kinds,
+    missing_fields,
+    missing_question,
+    wants_waive_bank,
+)
+from docs.official_forms import (
+    catalog_summary_ru,
+    download_official_file,
+    format_form_caption,
+    get_form,
+    match_official_forms,
+)
+from edit.business_docx import render_business_docx, suggest_business_filename
 from edit.docx_patch import (
     apply_patches,
     filter_valid_patches,
@@ -47,6 +73,7 @@ from edit.docx_patch import (
     write_structured_docx,
 )
 from edit.transforms import apply_transform, detect_transform
+from llm.business_extract import extract_business_fields, merge_extracted_fields
 from llm.client import (
     analyze_contract_risks,
     ask_document,
@@ -448,7 +475,7 @@ async def _require_quota(
     if result.ok:
         return result
     await message.answer(
-        result.message or "Лимит исчерпан. /pay",
+        result.message or "Лимит на сегодня исчерпан. Можно продолжить через /pay",
         reply_markup=upsell_keyboard(actor.id, lang),
     )
     return None
@@ -738,7 +765,9 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         status = await query.message.answer("Готовлю краткое содержание…")
         charge = consume(query.from_user.id, "summary", query.from_user.language_code)
         if not charge.ok:
-            await status.edit_text(charge.message or "Лимит исчерпан. /pay")
+            await status.edit_text(
+                charge.message or "Лимит на сегодня исчерпан. Можно продолжить через /pay"
+            )
             await query.message.answer(
                 "Открыть тарифы: /pay",
                 reply_markup=upsell_keyboard(
@@ -1137,16 +1166,84 @@ async def on_text(message: Message) -> None:
         } or (peek_intent == "clarify" and peek.get("family") != "write"):
             session.flow = "idle"
             session.last_op = ""
+            session.business_draft = None
         else:
             session.card_mode = False
             session.pending_clarify = None
-            mode = "form" if session.last_op == "write_form" else "text"
             session.flow = "idle"
+            if session.business_draft and session.business_draft.kind in KIND_LABELS_RU:
+                kind = session.business_draft.kind
+                session.business_draft = None
+                await _handle_business_write(message, session, text, kind=kind)
+                return
+            mode = "form" if session.last_op == "write_form" else "text"
             charge = await _require_quota(message, "write")
             if charge is None:
                 return
             session.remember_doc_task("write", text)
             await _handle_write(message, session, text, charge, mode=mode)
+            return
+
+    # Уточнение полей делового черновика
+    if session.business_draft is not None and session.flow == "clarifying":
+        if low in {"отмена", "cancel", "отменить", "стоп"}:
+            session.business_draft = None
+            session.flow = "idle"
+            await message.answer("Ок, создание документа отменил.", reply_markup=ui.docs_inline())
+            return
+        peek = classify_document_intent(
+            text,
+            has_files=bool(session.index.files),
+            has_facts=bool(session.doc_task and session.doc_task.facts),
+            awaiting_gap_fill=False,
+        )
+        peek_intent = str(peek.get("intent") or "none")
+        if peek_intent in {
+            "ask",
+            "edit",
+            "check",
+            "risks",
+            "extract",
+            "compare",
+            "format",
+            "card",
+            "gap_fill",
+        }:
+            session.business_draft = None
+            session.flow = "idle"
+        elif looks_like_chitchat(text) and not looks_like_edit(text):
+            session.business_draft = None
+            session.flow = "idle"
+            await message.answer(
+                "Ок, создание документа отменил.",
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        else:
+            await _continue_business_draft(message, session, text)
+            return
+
+    # Выбрали «какой документ» кнопкой, но описали текстом
+    if (
+        session.flow == "clarifying"
+        and session.pending_clarify is not None
+        and session.business_draft is None
+    ):
+        opts = list(session.pending_clarify.options or [])
+        if any(str(o.get("id") or "").startswith("biz:") for o in opts):
+            base = (session.pending_clarify.prompt or "").strip()
+            combined = f"{base}\n{text}".strip() if base else text
+            kind = detect_business_kind(combined) or kind_from_short_hint(text)
+            if kind:
+                session.pending_clarify = None
+                session.flow = "idle"
+                await _handle_business_write(message, session, combined, kind=kind)
+                return
+            await message.answer(
+                "Выберите тип кнопкой или напишите задачу целиком, "
+                "например: «Составь договор услуг с ООО Ромашка на 80 000 руб.»",
+                reply_markup=ui.business_kind_keyboard(),
+            )
             return
 
     # Привет / small-talk — не требуем файл
@@ -1257,6 +1354,8 @@ async def on_text(message: Message) -> None:
         "format",
         "write_form",
         "write_text",
+        "business_write",
+        "official_form",
         "clarify",
     }:
         session.card_mode = False
@@ -1305,6 +1404,10 @@ async def on_text(message: Message) -> None:
             )
             return
 
+        if intent == "official_form":
+            await _handle_official_form(message, session, text)
+            return
+
         if intent in {"write_form", "write_text"}:
             mode = "form" if intent == "write_form" else "text"
             # Мягкие / неуверенные запросы — короткое «Понял так» перед генерацией
@@ -1329,6 +1432,12 @@ async def on_text(message: Message) -> None:
                 return
             session.remember_doc_task("write", text)
             await _handle_write(message, session, text, charge, mode=mode)
+            return
+
+        if intent == "business_write":
+            kind = str(decision.get("doc_kind") or decision.get("mode") or "").strip()
+            session.pending_clarify = None
+            await _handle_business_write(message, session, text, kind=kind or None)
             return
 
         if intent == "edit":
@@ -1408,6 +1517,50 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
             await query.message.edit_text("Ок, отменил.")
         except Exception:
             await query.message.answer("Ок, отменил.")
+        return
+
+    if action.startswith("official:"):
+        form_id = action.split(":", 1)[-1].strip()
+        session.pending_clarify = None
+        session.flow = "idle"
+        form = get_form(form_id)
+        if form is None:
+            await query.message.answer(
+                "Не нашёл эту форму в каталоге.\n" + catalog_summary_ru(),
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        await _send_official_form(query.message, form)
+        return
+
+    if action.startswith("biz:"):
+        kind = action.split(":", 1)[-1].strip()
+        pending = session.pending_clarify
+        prompt = (pending.prompt if pending else "") or ""
+        session.pending_clarify = None
+        session.flow = "idle"
+        if kind not in KIND_LABELS_RU:
+            await query.message.answer(
+                "Выберите тип документа:",
+                reply_markup=ui.business_kind_keyboard(),
+            )
+            return
+        if not prompt.strip():
+            session.flow = "awaiting_write"
+            session.last_op = "business_write"
+            session.business_draft = BusinessDraft(kind=kind, base_prompt="")
+            await query.message.answer(
+                f"Ок, подготовлю {KIND_LABELS_RU[kind].lower()}. "
+                "Напишите задачу одним сообщением: стороны, сумма, сроки.",
+                reply_markup=ui.docs_inline(),
+            )
+            return
+        await query.message.answer(
+            ui.interpret_confirm_text(f"создам {KIND_LABELS_RU[kind].lower()}")
+        )
+        await _handle_business_write(
+            query.message, session, prompt, kind=kind, user=query.from_user
+        )
         return
 
     if action == "need_file":
@@ -1491,7 +1644,7 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
         charge = consume(user.id, "write", user.language_code)
         if not charge.ok:
             await query.message.answer(
-                charge.message or "Лимит исчерпан. /pay",
+                charge.message or "Лимит на сегодня исчерпан. Можно продолжить через /pay",
                 reply_markup=upsell_keyboard(user.id, user.language_code),
             )
             return
@@ -1508,6 +1661,283 @@ async def on_docs_clarify(query: CallbackQuery) -> None:
         return
 
     await query.message.answer("Не понял выбор. Напишите задачу ещё раз.")
+
+
+async def _send_official_form(message: Message, form) -> None:
+    path: Path | None = None
+    try:
+        if form.file_url:
+            path = await asyncio.to_thread(download_official_file, form.file_url)
+        caption = format_form_caption(form, with_file=path is not None)
+        if path is not None:
+            safe_name = f"{form.id}{path.suffix or '.pdf'}"
+            await message.answer_document(
+                FSInputFile(path, filename=safe_name),
+                caption=_fit(caption),
+                parse_mode="HTML",
+                reply_markup=ui.docs_inline(),
+            )
+        else:
+            await message.answer(
+                caption,
+                parse_mode="HTML",
+                reply_markup=ui.docs_inline(),
+                disable_web_page_preview=False,
+            )
+    finally:
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+async def _handle_official_form(
+    message: Message,
+    session: UserSession,
+    prompt: str,
+) -> None:
+    text = (prompt or "").strip()
+    hits = match_official_forms(text, limit=5, min_score=3)
+    if not hits:
+        await message.answer(
+            "Пока не нашёл такую официальную форму в каталоге.\n\n"
+            f"{catalog_summary_ru()}\n\n"
+            "Напишите код или название, например: «официальный бланк Р21001» "
+            "или «декларация УСН с сайта ФНС».\n"
+            "Если нужен просто макет Word (не ФНС) — так и напишите: "
+            "«сделай титульный лист…».",
+            reply_markup=ui.docs_inline(),
+        )
+        return
+    best_form, best_score = hits[0]
+    # One clear winner
+    if len(hits) == 1 or best_score >= hits[1][1] + 4:
+        await message.answer(ui.interpret_confirm_text(f"официальный бланк: {best_form.title}"))
+        await _send_official_form(message, best_form)
+        return
+    # Ambiguous — let user pick
+    ids = [f.id for f, _ in hits[:4]]
+    session.pending_clarify = PendingClarify(
+        prompt=text,
+        options=[{"id": f"official:{fid}", "label": get_form(fid).title if get_form(fid) else fid} for fid in ids],
+        question="Какой официальный бланк нужен?",
+    )
+    session.set_clarifying()
+    await message.answer(
+        "Нашёл несколько похожих бланков ФНС. Выберите:",
+        reply_markup=ui.official_forms_keyboard(ids),
+    )
+
+
+async def _handle_business_write(
+    message: Message,
+    session: UserSession,
+    prompt: str,
+    *,
+    kind: str | None = None,
+    user: User | None = None,
+) -> None:
+    text = (prompt or "").strip()
+    doc_kind = (kind or "").strip().lower()
+    if doc_kind not in KIND_LABELS_RU:
+        session.pending_clarify = PendingClarify(
+            prompt=text,
+            options=[
+                {"id": f"biz:{k}", "label": label}
+                for k, label in KIND_LABELS_RU.items()
+            ],
+            question="Какой документ подготовить?",
+        )
+        session.set_clarifying()
+        await message.answer(
+            "Какой документ подготовить?",
+            reply_markup=ui.business_kind_keyboard(),
+        )
+        return
+
+    status = await message.answer("Собираю данные для черновика…")
+    try:
+        extracted = await asyncio.to_thread(extract_business_fields, text, doc_kind)
+    except Exception as exc:
+        try:
+            await status.edit_text(_fit(f"Не удалось разобрать запрос: {exc}"))
+        except Exception:
+            await message.answer(_fit(f"Не удалось разобрать запрос: {exc}"))
+        return
+
+    if not text.strip():
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await message.answer(
+            "Опишите задачу одним сообщением: кто стороны, сумма, срок, предмет услуги."
+        )
+        return
+
+    fields = apply_defaults(doc_kind, dict(extracted.get("fields") or {}))
+    missing = missing_fields(doc_kind, fields)
+    draft = BusinessDraft(
+        kind=doc_kind,
+        fields=fields,
+        missing=missing,
+        base_prompt=text,
+        bank_asked=False,
+        questions_asked=0,
+    )
+    session.business_draft = draft
+
+    need_ask = _business_fields_to_ask(draft)
+    if need_ask:
+        draft.missing = need_ask
+        draft.questions_asked = 1
+        if "bank_details" in need_ask:
+            draft.bank_asked = True
+        session.set_clarifying()
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await message.answer(missing_question(need_ask))
+        return
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await _render_and_send_business(message, session, user=user)
+
+
+async def _continue_business_draft(
+    message: Message, session: UserSession, text: str
+) -> None:
+    draft = session.business_draft
+    if draft is None or draft.kind not in KIND_LABELS_RU:
+        session.business_draft = None
+        session.flow = "idle"
+        await message.answer("Черновик уже неактуален. Напишите задачу заново.")
+        return
+
+    if is_vague_user_reply(text):
+        need = _business_fields_to_ask(draft)
+        if need:
+            await message.answer(
+                missing_question(need)
+                + "\n\nНапишите конкретные данные (название, сумма, срок) "
+                "или «отмена», чтобы выйти."
+            )
+            return
+
+    status = await message.answer("Принял, дособираю данные…")
+    if wants_waive_bank(text):
+        draft.fields["_waive_bank_details"] = True
+
+    merged_prompt = f"{draft.base_prompt}\nУточнение: {text}".strip()
+    extracted = await asyncio.to_thread(
+        extract_business_fields, merged_prompt, draft.kind
+    )
+    draft.fields = merge_extracted_fields(
+        draft.fields, dict(extracted.get("fields") or {})
+    )
+    if wants_waive_bank(text):
+        draft.fields["_waive_bank_details"] = True
+    # Soft letter signature: after an explicit answer turn, allow placeholder
+    if (
+        draft.kind == "letter"
+        and "sender_sign" in (draft.missing or [])
+        and not str(draft.fields.get("sender_sign") or "").strip()
+    ):
+        draft.fields["sender_sign"] = text.strip()[:120] or "[ФИО / должность]"
+
+    draft.fields = apply_defaults(draft.kind, draft.fields)
+    draft.base_prompt = merged_prompt
+    draft.missing = missing_fields(draft.kind, draft.fields)
+    draft.questions_asked = int(draft.questions_asked or 0) + 1
+
+    need_ask = _business_fields_to_ask(draft)
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    if need_ask and draft.questions_asked < 3:
+        draft.missing = need_ask
+        if "bank_details" in need_ask:
+            draft.bank_asked = True
+        session.set_clarifying()
+        await message.answer(missing_question(need_ask))
+        return
+
+    await _render_and_send_business(message, session)
+
+
+def _business_fields_to_ask(draft: BusinessDraft) -> list[str]:
+    missing = list(draft.missing or missing_fields(draft.kind, draft.fields))
+    # Soft bank: ask at most once
+    if "bank_details" in missing and draft.bank_asked:
+        draft.fields["_waive_bank_details"] = True
+        missing = [m for m in missing if m != "bank_details"]
+    # After defaults, claim deadline should be gone; filter empty
+    return [m for m in missing if m]
+
+
+async def _render_and_send_business(
+    message: Message,
+    session: UserSession,
+    *,
+    user: User | None = None,
+) -> None:
+    draft = session.business_draft
+    if draft is None or draft.kind not in KIND_LABELS_RU:
+        await message.answer("Не удалось собрать документ — напишите задачу заново.")
+        return
+
+    charge = await _require_quota(message, "write", user=user)
+    if charge is None:
+        return
+
+    fields = apply_defaults(draft.kind, draft.fields)
+    dest_dir = session.user_dir(DATA_DIR)
+    fname = suggest_business_filename(draft.kind, fields)
+    dest = dest_dir / fname
+    n = 1
+    while dest.exists():
+        dest = dest_dir / f"{Path(fname).stem}_{n}.docx"
+        n += 1
+
+    status = await message.answer(ui.status_doc_write("text"))
+    try:
+        await asyncio.to_thread(render_business_docx, draft.kind, fields, dest)
+        async with session.lock:
+            await asyncio.to_thread(_ingest_path, session, dest)
+    except Exception as exc:
+        _refund(message, charge, "write", user=user)
+        session.business_draft = None
+        session.flow = "idle"
+        try:
+            await status.edit_text(_fit(f"Не удалось подготовить документ: {exc}"))
+        except Exception:
+            await message.answer(_fit(f"Не удалось подготовить документ: {exc}"))
+        return
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    kinds_mentioned = listed_business_kinds(draft.base_prompt)
+    caption = (
+        f"{KIND_LABELS_RU.get(draft.kind, 'Документ')}\n"
+        "Черновик — проверьте реквизиты и суммы перед отправкой."
+    )
+    if len(kinds_mentioned) >= 2:
+        caption += "\nДругие документы из запроса сделайте отдельным сообщением."
+
+    session.business_draft = None
+    session.flow = "idle"
+    session.remember_op("business_write")
+    session.remember_doc_task("write", draft.base_prompt)
+    await message.answer_document(FSInputFile(dest), caption=_fit(caption))
 
 
 async def _handle_write(

@@ -42,12 +42,25 @@ class DocTask:
 
 
 @dataclass
+class BusinessDraft:
+    """Черновик делового документа: поля + что ещё спросить."""
+
+    kind: str = ""
+    fields: dict = field(default_factory=dict)
+    missing: list[str] = field(default_factory=list)
+    base_prompt: str = ""
+    bank_asked: bool = False
+    questions_asked: int = 0
+
+
+@dataclass
 class UserSession:
     user_id: int
     index: DocumentIndex = field(default_factory=DocumentIndex)
     active_path: Path | None = None
     pending: PendingEdit | None = None
     pending_clarify: PendingClarify | None = None
+    business_draft: BusinessDraft | None = None
     doc_task: DocTask | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     card_mode: bool = False
@@ -97,6 +110,7 @@ class UserSession:
         """Сброс залипших режимов при меню / загрузке файла / смене задачи."""
         self.flow = "idle"
         self.pending_clarify = None
+        self.business_draft = None
         self.awaiting_gap_fill = False
         self.last_op = ""
         if not keep_card_mode:
@@ -201,6 +215,7 @@ class UserSession:
         self.active_path = None
         self.pending = None
         self.pending_clarify = None
+        self.business_draft = None
         self.doc_task = None
         self.card_mode = False
         self.flow = "idle"

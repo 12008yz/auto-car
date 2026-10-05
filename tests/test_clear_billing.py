@@ -23,15 +23,19 @@ class TestClearKeepsBilling(unittest.TestCase):
             config.BILLING_DB_PATH = db_path
             config.BILLING_OPEN_ACCESS = False
             session_mod._sessions.clear()
+            import billing.service as svc
+
+            svc._initialized = False
             try:
                 init_db()
                 uid = 777001
                 ensure_user(uid, "ru")
                 admin_grant_credits(uid, 50, "ru")
-                # Кредиты списываются раньше дневных лимитов
+                # Сначала дневная бесплатная попытка — кредиты не трогаем
                 self.assertTrue(consume(uid, "ask", "ru").ok)
                 before_credits = get_balance(uid, "ru")
-                self.assertEqual(before_credits.credits, 49)
+                self.assertEqual(before_credits.credits, 50)
+                self.assertEqual(before_credits.daily_ask, 1)
 
                 # Отдельный пользователь без кредитов — только дневной счётчик
                 uid2 = 777003
@@ -53,7 +57,7 @@ class TestClearKeepsBilling(unittest.TestCase):
 
                 after_credits = get_balance(uid, "ru")
                 after_daily = get_balance(uid2, "ru")
-                self.assertEqual(after_credits.credits, 49, msg="кредиты не должны слетать")
+                self.assertEqual(after_credits.credits, 50, msg="кредиты не должны слетать")
                 self.assertEqual(
                     after_daily.daily_ask, 3, msg="дневные попытки не должны обнуляться"
                 )

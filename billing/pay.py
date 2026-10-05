@@ -14,32 +14,55 @@ def plans_text(lang_ru: bool = True) -> str:
         lines = [
             "<b>Тарифы</b>",
             "",
-            "<b>Free</b> — до 100 вопросов / summary / карточек в день, "
-            "до 15 генераций текста (реферат и т.п.), без правок Word",
-            "<b>Pro</b> (30 дней) — пул кредитов + правки .docx",
-            "<b>Пакеты кредитов</b> — докупка (правки Word только на Pro)",
+            "<b>Бесплатно каждый день</b>",
+            "• 1 карточка товара",
+            "• 5 вопросов по файлу (включая краткое содержание)",
+            "• 1 создание документа",
+            "• правки Word — за кредиты",
             "",
+            "<b>Сколько стоят действия</b> (в кредитах)",
+            "вопрос — 1 · содержание — 2 · карточка — 2 · "
+            "создать документ — 3 · правка Word — 3",
+            "",
+            "<b>Pro</b> на 30 дней — сразу +200 кредитов.",
+            "Бесплатные попытки на день те же. Кредиты нужны для правок Word "
+            "и когда дневной лимит уже израсходован.",
+            "",
+            "<b>Купить</b>",
         ]
         for sku in SKUS.values():
+            extra = f", +{sku.credits} кредитов" if sku.days else ""
             lines.append(
                 f"• <b>{sku.title_ru}</b> — {sku.price_rub:.0f} ₽ / {sku.price_stars} ⭐"
-                + (f", +{sku.credits} кр." if sku.credits else "")
+                f"{extra}"
             )
         lines.append("")
-        lines.append("Оплата: /pay или кнопка «Тарифы»")
+        lines.append("Оплатить: /pay или кнопка «Тарифы»")
         return "\n".join(lines)
     lines = [
         "<b>Plans</b>",
         "",
-        "<b>Free</b> — up to 100 asks / summaries / cards per day, no Word edits",
-        "<b>Pro</b> (30 days) — credit pool + .docx edits",
-        "<b>Credit packs</b> — top-ups (except Word edits)",
+        "<b>Free every day</b>",
+        "• 1 product card",
+        "• 5 file questions (including a short summary)",
+        "• 1 document create",
+        "• Word edits — use credits",
         "",
+        "<b>What actions cost</b> (credits)",
+        "question — 1 · summary — 2 · card — 2 · "
+        "create document — 3 · Word edit — 3",
+        "",
+        "<b>Pro</b> for 30 days — +200 credits upfront.",
+        "Daily free attempts stay the same. Credits cover Word edits "
+        "and anything past today's free limit.",
+        "",
+        "<b>Buy</b>",
     ]
     for sku in SKUS.values():
+        extra = f", +{sku.credits} credits" if sku.days else ""
         lines.append(
             f"• <b>{sku.title_en}</b> — {sku.price_stars} Stars / {sku.price_rub:.0f} RUB"
-            + (f", +{sku.credits} cr." if sku.credits else "")
+            f"{extra}"
         )
     lines.append("")
     lines.append("Pay: /pay")
@@ -53,32 +76,32 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
         lines = [
             "<b>Баланс</b>",
             "",
-            f"Тариф: <b>{'Pro' if info.is_pro else 'Free'}</b>",
+            f"Тариф: <b>{'Pro' if info.is_pro else 'бесплатный'}</b>",
             f"Кредиты: <b>{info.credits}</b>",
-            f"Оплата: {'₽ UnitPay' if info.rail == 'unitpay' else 'Stars'}",
+            f"Оплата: {'₽ через UnitPay' if info.rail == 'unitpay' else 'Telegram Stars'}",
         ]
         if info.is_pro and info.expires_at:
-            lines.append(f"Pro до: {info.expires_at}")
+            lines.append(f"Pro действует до: {info.expires_at}")
+        lines.append("")
         if config.BILLING_OPEN_ACCESS:
-            lines.append("")
-            lines.append("<b>Тест: открытый доступ</b> — лимиты не блокируют.")
+            lines.append("<b>Тестовый режим</b> — пока всё бесплатно, лимиты не мешают.")
             lines.append(
-                f"Сегодня использовано: вопросы {info.daily_ask} · "
-                f"summary {info.daily_summary} · "
-                f"карточки {info.daily_card} · "
-                f"тексты {info.daily_write} · "
+                f"Сегодня использовано: карточка {info.daily_card} · "
+                f"вопросы {info.daily_ask} · "
+                f"создание {info.daily_write} · "
                 f"правки {info.daily_edit}"
             )
-            lines.append("Очистка чата баланс и попытки не сбрасывает.")
-        elif not info.is_pro:
-            lines.append("")
-            lines.append("<b>Сегодня (Free)</b>")
+            lines.append("Очистка чата не сбрасывает баланс и дневные счётчики.")
+        else:
+            lines.append("<b>Бесплатно сегодня</b> (использовано / лимит)")
             lines.append(
-                f"Вопросы {info.daily_ask}/{info.daily_ask_limit} · "
-                f"summary {info.daily_summary}/{info.daily_summary_limit} · "
-                f"карточки {info.daily_card}/{info.daily_card_limit} · "
-                f"тексты {info.daily_write}/{info.daily_write_limit} · "
-                f"правки {info.daily_edit}/{info.daily_edit_limit}"
+                f"карточка {info.daily_card}/{info.daily_card_limit} · "
+                f"вопросы {info.daily_ask}/{info.daily_ask_limit} · "
+                f"создание {info.daily_write}/{info.daily_write_limit}"
+            )
+            lines.append(
+                "Правки Word — всегда за кредиты (3 за раз). "
+                "Сверх дневного лимита — тоже кредиты."
             )
         return "\n".join(lines)
     lines = [
@@ -86,30 +109,30 @@ def balance_text(telegram_id: int, language_code: str | None = None) -> str:
         "",
         f"Plan: <b>{'Pro' if info.is_pro else 'Free'}</b>",
         f"Credits: <b>{info.credits}</b>",
-        f"Payment: {'Stars' if info.rail == 'stars' else 'UnitPay RUB'}",
+        f"Payment: {'Telegram Stars' if info.rail == 'stars' else 'UnitPay (RUB)'}",
     ]
     if info.is_pro and info.expires_at:
         lines.append(f"Pro until: {info.expires_at}")
+    lines.append("")
     if config.BILLING_OPEN_ACCESS:
-        lines.append("")
-        lines.append("<b>Test: open access</b> — limits not enforced.")
+        lines.append("<b>Test mode</b> — everything is free for now; limits don’t block.")
         lines.append(
-            f"Used today: asks {info.daily_ask} · "
-            f"summary {info.daily_summary} · "
-            f"cards {info.daily_card} · "
-            f"texts {info.daily_write} · "
+            f"Used today: card {info.daily_card} · "
+            f"questions {info.daily_ask} · "
+            f"create {info.daily_write} · "
             f"edits {info.daily_edit}"
         )
-        lines.append("Clear chat does not reset balance or usage.")
-    elif not info.is_pro:
-        lines.append("")
-        lines.append("<b>Today (Free)</b>")
+        lines.append("Clear chat does not reset balance or daily counters.")
+    else:
+        lines.append("<b>Free today</b> (used / limit)")
         lines.append(
-            f"Asks {info.daily_ask}/{info.daily_ask_limit} · "
-            f"summary {info.daily_summary}/{info.daily_summary_limit} · "
-            f"cards {info.daily_card}/{info.daily_card_limit} · "
-            f"texts {info.daily_write}/{info.daily_write_limit} · "
-            f"edits {info.daily_edit}/{info.daily_edit_limit}"
+            f"card {info.daily_card}/{info.daily_card_limit} · "
+            f"questions {info.daily_ask}/{info.daily_ask_limit} · "
+            f"create {info.daily_write}/{info.daily_write_limit}"
+        )
+        lines.append(
+            "Word edits always use credits (3 each). "
+            "Past today’s free limit also uses credits."
         )
     return "\n".join(lines)
 

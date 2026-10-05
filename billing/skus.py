@@ -57,13 +57,14 @@ ACTION_COST: dict[Action, int] = {
     "write": 3,
 }
 
-# Free daily caps (при BILLING_OPEN_ACCESS лимиты не применяются)
+# Free daily caps (при BILLING_OPEN_ACCESS лимиты не применяются).
+# ask + summary делят один бакет daily_ask (лимит = FREE_DAILY["ask"]).
 FREE_DAILY: dict[Action, int] = {
-    "ask": 100,
-    "summary": 100,
-    "edit": 50,
-    "card": 100,
-    "write": 15,
+    "ask": 5,
+    "summary": 0,  # не отдельный free-cap; слот из ask
+    "edit": 0,
+    "card": 1,
+    "write": 1,
 }
 
 

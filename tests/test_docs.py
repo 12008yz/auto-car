@@ -139,7 +139,7 @@ class TestIntentRouter(unittest.TestCase):
 
     def test_compose_contract_is_write_or_clarify(self) -> None:
         intent = self._intent("Составь договор", has_files=False)
-        self.assertIn(intent, {"write_form", "write_text", "clarify"})
+        self.assertIn(intent, {"business_write", "write_form", "write_text", "clarify"})
 
     def test_contract_question_not_write_form(self) -> None:
         """«договор» в вопросе не должен становиться созданием бланка."""
@@ -166,7 +166,7 @@ class TestIntentRouter(unittest.TestCase):
         )
         self.assertEqual(
             self._intent("Составь претензию поставщику о просрочке", has_files=False),
-            "write_text",
+            "business_write",
         )
         self.assertEqual(
             self._intent("Нужно продать кружку керамическую 300 мл", has_files=False),
@@ -230,7 +230,7 @@ class TestIntentRouter(unittest.TestCase):
         )
         self.assertEqual(
             self._intent("Создай новый документ — претензию", has_files=True),
-            "write_text",
+            "business_write",
         )
 
     def test_guard_metadata_present_on_overrides(self) -> None:
@@ -369,10 +369,14 @@ class TestDocSession(unittest.TestCase):
         session.awaiting_gap_fill = True
         session.card_mode = True
         session.pending = PendingEdit(kind="patch", source=Path("x.docx"), patches=[])
+        from bot.session import BusinessDraft
+
+        session.business_draft = BusinessDraft(kind="invoice", base_prompt="счёт")
 
         session.clear_dialog_modes()
         self.assertEqual(session.flow, "idle")
         self.assertIsNone(session.pending_clarify)
+        self.assertIsNone(session.business_draft)
         self.assertFalse(session.awaiting_gap_fill)
         self.assertFalse(session.card_mode)
         self.assertIsNone(session.pending)
@@ -633,7 +637,15 @@ class TestUiWiring(unittest.TestCase):
             self.assertIn(need, data)
         self.assertTrue(ui.docs_fill_example_text())
         self.assertTrue(ui.docs_more_examples_text())
-        self.assertIn("бесплатно", ui.help_text().lower())
+        help_l = ui.help_text().lower()
+        self.assertIn("/plans", help_l)
+        self.assertIn("/balance", help_l)
+        import config
+
+        if config.BILLING_OPEN_ACCESS:
+            self.assertIn("бесплатно", help_l)
+        else:
+            self.assertIn("кредит", help_l)
 
     def test_soft_landing_keyboard(self) -> None:
         from bot import ui

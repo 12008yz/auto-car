@@ -200,12 +200,42 @@ def get_balance(telegram_id: int, language_code: str | None = None) -> BalanceIn
             daily_write=int(wallet["daily_write"] if wallet else 0),
             daily_edit=int(wallet["daily_edit"] if wallet else 0),
             daily_ask_limit=FREE_DAILY["ask"],
-            daily_summary_limit=FREE_DAILY["summary"],
+            daily_summary_limit=FREE_DAILY["ask"],  # общий бакет с ask
             daily_card_limit=FREE_DAILY["card"],
             daily_write_limit=FREE_DAILY["write"],
             daily_edit_limit=FREE_DAILY["edit"],
             is_pro=is_pro,
         )
+
+
+def _daily_column(action: Action) -> str:
+    # ask + summary → общий счётчик daily_ask
+    if action in {"ask", "summary"}:
+        return "daily_ask"
+    return {
+        "card": "daily_card",
+        "write": "daily_write",
+        "edit": "daily_edit",
+    }[action]
+
+
+def _free_daily_limit(action: Action) -> int:
+    if action in {"ask", "summary"}:
+        return int(FREE_DAILY["ask"])
+    return int(FREE_DAILY.get(action, 0))
+
+
+def _credits_ru(n: int) -> str:
+    """Russian plural: 1 кредит, 2–4 кредита, 5+ кредитов."""
+    n = abs(int(n))
+    mod10, mod100 = n % 10, n % 100
+    if mod10 == 1 and mod100 != 11:
+        word = "кредит"
+    elif mod10 in {2, 3, 4} and mod100 not in {12, 13, 14}:
+        word = "кредита"
+    else:
+        word = "кредитов"
+    return f"{n} {word}"
 
 
 def consume(telegram_id: int, action: Action, language_code: str | None = None) -> ConsumeResult:
@@ -219,7 +249,6 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
     cost = ACTION_COST[action]
     with _lock, connect() as conn:
         _reset_daily_if_needed(conn, telegram_id)
-        is_pro = _is_pro(conn, telegram_id)
 
         wallet = conn.execute(
             "SELECT credits_balance FROM wallets WHERE telegram_id = ?",
@@ -227,7 +256,24 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
         ).fetchone()
         balance = int(wallet["credits_balance"] if wallet else 0)
 
-        # Bought credits work for Free and Pro
+        # 1) Дневная бесплатная попытка (edit: limit 0)
+        limit = _free_daily_limit(action)
+        if limit > 0:
+            col = _daily_column(action)
+            daily = conn.execute(
+                f"SELECT {col} AS used FROM wallets WHERE telegram_id = ?",
+                (telegram_id,),
+            ).fetchone()
+            used = int(daily["used"] if daily else 0)
+            if used < limit:
+                conn.execute(
+                    f"UPDATE wallets SET {col} = {col} + 1 WHERE telegram_id = ?",
+                    (telegram_id,),
+                )
+                conn.commit()
+                return ConsumeResult(ok=True, charged="daily", amount=0)
+
+        # 2) Кредиты
         if balance >= cost:
             conn.execute(
                 "UPDATE wallets SET credits_balance = credits_balance - ? WHERE telegram_id = ?",
@@ -236,58 +282,44 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
             conn.commit()
             return ConsumeResult(ok=True, charged="credits", amount=cost)
 
-        if is_pro:
-            conn.commit()
+        # 3) Отказ
+        conn.commit()
+        if action == "edit":
             return ConsumeResult(
                 ok=False,
                 reason="no_credits",
                 message=(
-                    f"Не хватает кредитов (нужно {cost}, есть {balance}). "
-                    "Докупите пакет: /pay"
+                    f"Чтобы править Word, нужно {_credits_ru(cost)}. "
+                    f"Сейчас у вас {_credits_ru(balance)}. Пополнить: /pay"
                 ),
             )
-
-        # Free tier without credits: daily caps
-        limit = FREE_DAILY[action]
-        if limit <= 0:
-            conn.commit()
-            return ConsumeResult(
-                ok=False,
-                reason="pro_required",
-                message="Эта функция временно недоступна. /pay",
-            )
-        col = _daily_column(action)
-        daily = conn.execute(
-            f"SELECT {col} AS used FROM wallets WHERE telegram_id = ?",
-            (telegram_id,),
-        ).fetchone()
-        used = int(daily["used"] if daily else 0)
-        if used >= limit:
-            conn.commit()
+        if limit > 0:
+            if balance <= 0:
+                return ConsumeResult(
+                    ok=False,
+                    reason="daily_limit",
+                    message=(
+                        "На сегодня бесплатная попытка уже использована. "
+                        "Можно продолжить с кредитами или Pro — /pay"
+                    ),
+                )
             return ConsumeResult(
                 ok=False,
                 reason="daily_limit",
                 message=(
-                    f"Дневной лимит Free исчерпан ({used}/{limit}). "
-                    "Подписка или пакет кредитов: /pay"
+                    f"На сегодня бесплатная попытка уже использована. "
+                    f"Нужно ещё {_credits_ru(cost)}, сейчас {_credits_ru(balance)}. "
+                    f"Продолжить: /pay"
                 ),
             )
-        conn.execute(
-            f"UPDATE wallets SET {col} = {col} + 1 WHERE telegram_id = ?",
-            (telegram_id,),
+        return ConsumeResult(
+            ok=False,
+            reason="no_credits",
+            message=(
+                f"Не хватает кредитов: нужно {_credits_ru(cost)}, "
+                f"сейчас {_credits_ru(balance)}. Пополнить: /pay"
+            ),
         )
-        conn.commit()
-        return ConsumeResult(ok=True, charged="daily", amount=1)
-
-
-def _daily_column(action: Action) -> str:
-    return {
-        "ask": "daily_ask",
-        "summary": "daily_summary",
-        "card": "daily_card",
-        "write": "daily_write",
-        "edit": "daily_edit",
-    }[action]
 
 
 def _bump_daily_counter(telegram_id: int, action: Action) -> None:

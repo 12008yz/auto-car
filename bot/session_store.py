@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from billing.db import connect
-from bot.session import DocTask, PendingClarify, PendingEdit, UserSession
+from bot.session import BusinessDraft, DocTask, PendingClarify, PendingEdit, UserSession
 
 _MAX_STORED_MESSAGE_IDS = 500
 
@@ -57,6 +57,17 @@ def session_to_payload(session: UserSession) -> dict[str, Any]:
             "filename": session.doc_task.filename,
             "gap_fields": list(session.doc_task.gap_fields),
         }
+    business = None
+    if session.business_draft is not None:
+        d = session.business_draft
+        business = {
+            "kind": d.kind,
+            "fields": dict(d.fields),
+            "missing": list(d.missing),
+            "base_prompt": d.base_prompt,
+            "bank_asked": bool(d.bank_asked),
+            "questions_asked": int(d.questions_asked),
+        }
     ids = list(session.chat_message_ids)[-_MAX_STORED_MESSAGE_IDS:]
     return {
         "flow": session.flow,
@@ -67,6 +78,7 @@ def session_to_payload(session: UserSession) -> dict[str, Any]:
         "pending": pending,
         "pending_clarify": clarify,
         "doc_task": doc_task,
+        "business_draft": business,
         "chat_message_ids": ids,
     }
 
@@ -123,6 +135,19 @@ def apply_payload(session: UserSession, payload: dict[str, Any]) -> None:
         )
     else:
         session.doc_task = None
+
+    biz_raw = payload.get("business_draft")
+    if isinstance(biz_raw, dict) and str(biz_raw.get("kind") or "").strip():
+        session.business_draft = BusinessDraft(
+            kind=str(biz_raw.get("kind") or ""),
+            fields=dict(biz_raw.get("fields") or {}),
+            missing=list(biz_raw.get("missing") or []),
+            base_prompt=str(biz_raw.get("base_prompt") or ""),
+            bank_asked=bool(biz_raw.get("bank_asked")),
+            questions_asked=int(biz_raw.get("questions_asked") or 0),
+        )
+    else:
+        session.business_draft = None
 
     session.chat_message_ids.clear()
     for mid in payload.get("chat_message_ids") or []:

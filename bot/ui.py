@@ -10,6 +10,8 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+import config
+
 # Подписи нижней клавиатуры (должны совпадать с обработчиками)
 BTN_CARD = "Карточка"
 BTN_DOCS = "Документы"
@@ -102,6 +104,35 @@ def docs_inline() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
         ]
     )
+
+
+def business_kind_keyboard() -> InlineKeyboardMarkup:
+    from docs.business_types import KIND_LABELS_RU
+
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"docs:go:biz:{kind}")]
+        for kind, label in KIND_LABELS_RU.items()
+    ]
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="docs:go:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def official_forms_keyboard(form_ids: list[str]) -> InlineKeyboardMarkup:
+    from docs.official_forms import get_form
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for fid in form_ids:
+        form = get_form(fid)
+        if form is None:
+            continue
+        label = form.title
+        if len(label) > 64:
+            label = label[:61] + "…"
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"docs:go:official:{fid}")]
+        )
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="docs:go:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def clarify_intent_keyboard(options: list[dict[str, str]]) -> InlineKeyboardMarkup:
@@ -223,7 +254,7 @@ def clear_prompt_text() -> str:
         "Удалим переписку в этом чате "
         "(сообщения старше ~48 часов Telegram боту стереть не даёт).\n"
         "Также очистятся документы, карточки и сессия диалога.\n\n"
-        "<b>Баланс, кредиты и дневные попытки не трогаем.</b>"
+        "<b>Баланс, кредиты и дневные бесплатные попытки не трогаем.</b>"
     )
 
 
@@ -242,6 +273,16 @@ def welcome_text(name: str | None = None) -> str:
 
 
 def help_text() -> str:
+    if config.BILLING_OPEN_ACCESS:
+        billing_line = (
+            "Пока тестовый режим: всё бесплатно. "
+            "Тарифы и лимиты — /plans · баланс — /balance"
+        )
+    else:
+        billing_line = (
+            "Каждый день есть бесплатные попытки; дальше — кредиты или Pro. "
+            "Подробнее: /plans · баланс: /balance"
+        )
     return (
         "<b>Как пользоваться</b>\n\n"
         "<b>Карточка товара</b>\n"
@@ -251,10 +292,12 @@ def help_text() -> str:
         "• сравнить 2 файла · что не заполнено\n"
         "• заполнить бланк · точечная правка · сменить тон\n"
         "• оформить по образцу\n"
-        "• создать: бланк, реферат, письмо, претензия, КП\n\n"
+        "• создать: бланк, реферат, письмо, претензия, КП\n"
+        "• деловые черновики: договор · акт · счёт · претензия · письмо\n"
+        "• официальные бланки ФНС: «официальный бланк Р21001», «декларация УСН»\n\n"
         "Форматы: Word · PDF · Excel · PowerPoint · TXT · MD · CSV\n"
-        "Сейчас всё открыто бесплатно (тест).\n\n"
-        "/balance · /clear · /use имя_файла"
+        f"{billing_line}\n\n"
+        "/clear · /use имя_файла"
     )
 
 
@@ -296,6 +339,8 @@ def docs_prompt_text() -> str:
         "• <i>«Сделай текст официальнее / короче»</i>\n\n"
         "<b>Создать</b>\n"
         "• бланк · реферат · письмо · претензия · КП\n"
+        "• договор · акт · счёт (черновик Word — проверьте реквизиты)\n"
+        "• официальный бланк ФНС — напишите код/название (Р21001, УСН, патент…)\n"
         "• <i>«Оформи по образцу»</i> — 2 файла: содержание + образец\n\n"
         "Форматы: Word · PDF · Excel · PPT · TXT · MD · CSV · до 20 МБ"
     )
@@ -303,8 +348,18 @@ def docs_prompt_text() -> str:
 
 def docs_form_example_text() -> str:
     return (
-        "<b>Пример: бланк</b>\n"
-        "Скопируйте и отправьте:\n\n"
+        "<b>Пример: бланк</b>\n\n"
+        "<b>1) Официальный бланк ФНС</b>\n"
+        "Напишите название формы обычным языком — пришлю "
+        "<b>ссылку на страницу ФНС</b> и <b>файл</b>, если он есть на сайте.\n\n"
+        "Примеры (скопируйте):\n"
+        "<code>Нужен официальный бланк Р21001 — регистрация ИП</code>\n"
+        "<code>Пришли уведомление о переходе на УСН с сайта ФНС</code>\n"
+        "<code>Официальная декларация по УСН</code>\n"
+        "<code>Заявление на патент официальное</code>\n\n"
+        "В каталоге сейчас: Р21001 · Р24001 · Р26001 · уведомление по УСН · "
+        "декларация УСН · заявление на патент.\n\n"
+        "<b>2) Простой шаблон Word</b> (не бланк ФНС — макет для заполнения):\n"
         "<code>Сделай титульный лист налоговой декларации для ИП — "
         "только первая страница, поля пустыми для заполнения</code>"
     )
