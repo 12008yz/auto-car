@@ -15,12 +15,21 @@ import config
 # Подписи нижней клавиатуры (должны совпадать с обработчиками)
 BTN_CARD = "Карточка"
 BTN_DOCS = "Документы"
+BTN_IP_NPD = "ИП на НПД — бесплатно, без деклараций"
 BTN_BALANCE = "Баланс"
 BTN_PLANS = "Тарифы"
 BTN_HELP = "Помощь"
 BTN_CLEAR = "Очистить"
 
-REPLY_BUTTONS = {BTN_CARD, BTN_DOCS, BTN_BALANCE, BTN_PLANS, BTN_HELP, BTN_CLEAR}
+REPLY_BUTTONS = {
+    BTN_CARD,
+    BTN_DOCS,
+    BTN_IP_NPD,
+    BTN_BALANCE,
+    BTN_PLANS,
+    BTN_HELP,
+    BTN_CLEAR,
+}
 
 BOT_COMMANDS = [
     BotCommand(command="start", description="Открыть главное меню"),
@@ -39,6 +48,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_CARD), KeyboardButton(text=BTN_DOCS)],
+            [KeyboardButton(text=BTN_IP_NPD)],
             [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_PLANS)],
             [KeyboardButton(text=BTN_HELP), KeyboardButton(text=BTN_CLEAR)],
         ],
@@ -54,6 +64,12 @@ def home_inline() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="Сделать карточку", callback_data="menu:card"),
                 InlineKeyboardButton(text="Документы", callback_data="menu:docs"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BTN_IP_NPD,
+                    callback_data="menu:ip_npd",
+                ),
             ],
             [
                 InlineKeyboardButton(text="Баланс", callback_data="menu:balance"),
@@ -101,6 +117,12 @@ def docs_inline() -> InlineKeyboardMarkup:
                     text="Создать документ", callback_data="docs:go:write_text"
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text=BTN_IP_NPD,
+                    callback_data="menu:ip_npd",
+                ),
+            ],
             [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
         ]
     )
@@ -132,6 +154,99 @@ def official_forms_keyboard(form_ids: list[str]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=label, callback_data=f"docs:go:official:{fid}")]
         )
     rows.append([InlineKeyboardButton(text="Отмена", callback_data="docs:go:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ip_npd_keyboard(step_id: str) -> InlineKeyboardMarkup:
+    from docs.ip_npd_guide import alfa_url, next_step_id, tochka_url
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if step_id == "diy":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Заявка в Альфе — ссылка бота",
+                    url=alfa_url(),
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Счёт в Точке — ссылка бота",
+                    url=tochka_url(),
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="К простому пути",
+                    callback_data="ipnpd:step:why",
+                )
+            ]
+        )
+        rows.append(
+            [InlineKeyboardButton(text="« В меню", callback_data="menu:home")]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    nxt = next_step_id(step_id)
+    if step_id == "alfa":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Заявка в Альфе — ссылка бота",
+                    url=alfa_url(),
+                )
+            ]
+        )
+    if step_id == "tochka":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Счёт в Точке — ссылка бота",
+                    url=tochka_url(),
+                )
+            ]
+        )
+    if nxt:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Дальше →", callback_data=f"ipnpd:step:{nxt}"
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Документы", callback_data="menu:docs"
+                ),
+                InlineKeyboardButton(
+                    text="Карточка", callback_data="menu:card"
+                ),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Тарифы", callback_data="menu:plans"
+                ),
+                InlineKeyboardButton(
+                    text="В начало гида", callback_data="ipnpd:step:why"
+                ),
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Сделать самому", callback_data="ipnpd:diy"
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="« В меню", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -267,7 +382,8 @@ def welcome_text(name: str | None = None) -> str:
         "и умная работа с документами — в одном чате.\n\n"
         "<b>Быстрый старт</b>\n"
         "1. «Карточка» — фото, видео или описание товара\n"
-        "2. «Документы» — разобрать файл, поправить Word или создать новый\n\n"
+        "2. «Документы» — разобрать файл, поправить Word или создать новый\n"
+        "3. «ИП на НПД» — открыть бесплатно, без деклараций (мастер)\n\n"
         "Меню всегда внизу экрана."
     )
 
@@ -294,7 +410,8 @@ def help_text() -> str:
         "• оформить по образцу\n"
         "• создать: бланк, реферат, письмо, претензия, КП\n"
         "• деловые черновики: договор · акт · счёт · претензия · письмо\n"
-        "• официальные бланки ФНС: «официальный бланк Р21001», «декларация УСН»\n\n"
+        "• официальные бланки ФНС: «официальный бланк Р21001», «декларация УСН»\n"
+        "• открыть ИП на НПД: кнопка в меню — бесплатно, без деклараций\n\n"
         "Форматы: Word · PDF · Excel · PowerPoint · TXT · MD · CSV\n"
         f"{billing_line}\n\n"
         "/clear · /use имя_файла"

@@ -1,7 +1,7 @@
 # Design: Guide «ИП на НПД» (Альфа → Точка) (pyBot)
 
 **Date:** 2026-10-05  
-**Status:** Draft after consistency self-review (awaiting user approval before implementation).
+**Status:** Approved and implemented (2026-10-06).
 
 ## Goal
 

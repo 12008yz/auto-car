@@ -64,6 +64,7 @@ from docs.official_forms import (
     get_form,
     match_official_forms,
 )
+from docs.ip_npd_guide import diy_text, first_step, step_by_id
 from edit.business_docx import render_business_docx, suggest_business_filename
 from edit.docx_patch import (
     apply_patches,
@@ -593,6 +594,10 @@ async def on_menu_button(message: Message) -> None:
             reply_markup=ui.docs_inline(),
         )
         return
+    if text == ui.BTN_IP_NPD:
+        session.clear_dialog_modes()
+        await _send_ip_npd_step(message, "why")
+        return
     if text == ui.BTN_BALANCE:
         from billing.handlers import cmd_balance
 
@@ -663,6 +668,10 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             parse_mode="HTML",
             reply_markup=ui.back_home_inline(),
         )
+        return
+    if action == "ip_npd":
+        session.clear_dialog_modes()
+        await _send_ip_npd_step(query.message, "why")
         return
     if action == "card":
         session.clear_dialog_modes(keep_card_mode=True)
@@ -1500,6 +1509,40 @@ async def on_text(message: Message) -> None:
         hint="Пока не отнёс фразу ни к документам, ни к карточке.",
         remember_prompt=text,
     )
+
+
+async def _send_ip_npd_step(message: Message, step_id: str) -> None:
+    step = step_by_id(step_id) or first_step()
+    await message.answer(
+        step.body,
+        parse_mode="HTML",
+        reply_markup=ui.ip_npd_keyboard(step.id),
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("ipnpd:"))
+async def on_ip_npd_guide(query: CallbackQuery) -> None:
+    if query.from_user is None or not query.data or query.message is None:
+        await query.answer()
+        return
+    await query.answer()
+    session = get_session(query.from_user.id)
+    session.clear_dialog_modes()
+    action = query.data.split(":", 1)[-1]
+    if action == "diy":
+        await query.message.answer(
+            diy_text(),
+            parse_mode="HTML",
+            reply_markup=ui.ip_npd_keyboard("diy"),
+            disable_web_page_preview=True,
+        )
+        return
+    if action.startswith("step:"):
+        step_id = action.split(":", 1)[-1].strip() or "why"
+        await _send_ip_npd_step(query.message, step_id)
+        return
+    await _send_ip_npd_step(query.message, "why")
 
 
 @router.callback_query(F.data.startswith("docs:go:"))

@@ -71,3 +71,21 @@ BILLING_ADMIN_IDS = {
 }
 
 STARS_SUBSCRIPTION_PERIOD = 30 * 24 * 60 * 60  # 2592000
+
+# Partner / guide links (ИП на НПД)
+_ALFA_IP_NPD_DEFAULT = "https://alfabank.sale/sme/agent/start/ip-npd/"
+_TOCHKA_RKO_DEFAULT = "https://tochka.com/"
+_MY_NALOG_DEFAULT = "https://npd.nalog.ru/"
+_FNS_IP_REG_DEFAULT = "https://service.nalog.ru/gosreg/index.html"
+ALFA_IP_NPD_URL = (
+    os.getenv("ALFA_IP_NPD_URL", _ALFA_IP_NPD_DEFAULT).strip() or _ALFA_IP_NPD_DEFAULT
+)
+TOCHKA_RKO_URL = (
+    os.getenv("TOCHKA_RKO_URL", _TOCHKA_RKO_DEFAULT).strip() or _TOCHKA_RKO_DEFAULT
+)
+MY_NALOG_URL = (
+    os.getenv("MY_NALOG_URL", _MY_NALOG_DEFAULT).strip() or _MY_NALOG_DEFAULT
+)
+FNS_IP_REG_URL = (
+    os.getenv("FNS_IP_REG_URL", _FNS_IP_REG_DEFAULT).strip() or _FNS_IP_REG_DEFAULT
+)
