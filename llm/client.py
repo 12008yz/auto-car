@@ -1392,7 +1392,14 @@ def apply_document_routing_guards(
         # 3) Вопрос/проверка важнее создания (но не ломаем явный write с сильным глаголом)
         if (
             questionish
-            and intent in {"clarify", "write_form", "write_text", "business_write", "none", "card"}
+            and intent in {
+                "clarify",
+                "write_form",
+                "write_text",
+                "business_write",
+                "none",
+                "card",
+            }
             and not (strong and intent in {"write_form", "write_text", "business_write"})
         ):
             if fillish:
@@ -1412,7 +1419,14 @@ def apply_document_routing_guards(
             }
 
         # 4) Тон / правка
-        if toneish and intent not in {"edit", "check", "risks", "extract", "compare"}:
+        if toneish and intent not in {
+            "edit",
+            "check",
+            "risks",
+            "extract",
+            "compare",
+            "official_form",
+        }:
             return {
                 "intent": "edit",
                 "confidence": 0.9,
@@ -1584,6 +1598,17 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
     lowered = raw.lower()
     if not lowered:
         return {"intent": "none", "confidence": 1.0, "mode": "", "family": ""}
+
+    from docs.official_forms import looks_like_official_form_request
+
+    # Official FNS blank — even bare codes like «Р21001»
+    if looks_like_official_form_request(raw, has_files=has_files):
+        return {
+            "intent": "official_form",
+            "confidence": 0.93,
+            "mode": "",
+            "family": "write",
+        }
 
     form_keys = (
         "титульн",
@@ -1912,16 +1937,6 @@ def _classify_document_intent_raw(text: str, *, has_files: bool = False) -> dict
     # Создание: бланк vs текст
     if has_write_verb or has_form or has_text or (mentions_file and has_write_verb):
         from docs.business_types import KIND_LABELS_RU, detect_business_kind
-        from docs.official_forms import looks_like_official_form_request
-
-        # Официальный бланк ФНС — до academic write_form / business drafts
-        if looks_like_official_form_request(text, has_files=has_files):
-            return {
-                "intent": "official_form",
-                "confidence": 0.93,
-                "mode": "",
-                "family": "write",
-            }
 
         biz_kind = detect_business_kind(text)
         if biz_kind:

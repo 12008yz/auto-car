@@ -35,11 +35,17 @@ class TestOfficialFormsCatalog(unittest.TestCase):
         self.assertFalse(looks_like_official_form_request(text))
         self.assertEqual(classify_document_intent(text)["intent"], "write_form")
 
-    def test_official_phrase_routes(self) -> None:
+    def test_short_catalog_phrases(self) -> None:
         from llm.client import classify_document_intent
 
-        d = classify_document_intent("Нужен официальный бланк Р21001 — регистрация ИП")
-        self.assertEqual(d["intent"], "official_form")
+        self.assertEqual(classify_document_intent("Р21001")["intent"], "official_form")
+        self.assertEqual(
+            classify_document_intent("декларация УСН")["intent"], "official_form"
+        )
+        self.assertEqual(
+            classify_document_intent("Пришли декларацию УСН")["intent"],
+            "official_form",
+        )
 
     def test_allowed_hosts_and_disclaimer(self) -> None:
         from docs.official_forms import (

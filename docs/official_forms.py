@@ -248,8 +248,13 @@ def looks_like_official_form_request(text: str, *, has_files: bool = False) -> b
         k in lowered for k in ("р21001", "р24001", "р26001", "усн", "патент", "ип")
     ):
         return True
-    # Strong catalog hit (codes / multi-alias) without mockup wording
-    return bool(match_official_forms(text, limit=1, min_score=8))
+    # Strong / unique catalog hit (e.g. «декларация УСН», «патент»)
+    hits = match_official_forms(text, limit=2, min_score=6)
+    if not hits:
+        return False
+    if len(hits) == 1:
+        return True
+    return hits[0][1] >= hits[1][1] + 3
 
 
 def get_form_by_code(lowered: str) -> OfficialForm | None:
