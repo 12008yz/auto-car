@@ -29,6 +29,7 @@ from billing.unitpay import is_valid_email
 from bot import ui
 from bot.session import get_session
 from bot.session_store import save_dialog_session
+import config
 from config import BILLING_ADMIN_IDS
 
 router = Router(name="billing")
@@ -55,6 +56,13 @@ def _lang_ru(message_or_user_lang: str | None, rail: Rail | None = None) -> bool
     if rail == "unitpay" and not code.startswith("en"):
         return True
     return False
+
+
+@router.message(Command("legal", "offer"))
+async def cmd_legal(message: Message) -> None:
+    from billing.legal_site import legal_links_for_bot
+
+    await message.answer(legal_links_for_bot(), parse_mode="HTML", disable_web_page_preview=True)
 
 
 @router.message(Command("plans"))
@@ -167,17 +175,26 @@ async def on_pay_sku(query: CallbackQuery) -> None:
             save_dialog_session(session)
         except Exception:
             pass
+        base = (config.BILLING_PUBLIC_BASE_URL or "").rstrip("/")
+        offer_hint = ""
+        if base and "your_domain" not in base.lower():
+            offer_hint = (
+                f"\nОплачивая, вы принимаете <a href=\"{base}/offer\">оферту</a> "
+                f"и <a href=\"{base}/privacy\">политику ПДн</a>."
+            )
         if _lang_ru(lang, "unitpay"):
             ask = (
                 "Для чека 54‑ФЗ нужен <b>email</b>.\n"
                 f"Тариф: <b>{get_sku(sku_id).title_ru}</b>.\n"
                 "Напишите адрес почты одним сообщением (или «отмена»)."
+                f"{offer_hint}"
             )
         else:
             ask = (
                 "Email is required for the fiscal receipt.\n"
                 f"Plan: <b>{get_sku(sku_id).title_en}</b>.\n"
                 "Send your email in one message (or «cancel»)."
+                f"{offer_hint}"
             )
         if isinstance(query.message, Message):
             await query.message.answer(ask, parse_mode="HTML")

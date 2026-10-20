@@ -8,6 +8,7 @@ transformers
 sentence-transformers
 aiogram
 aiohttp
+aiohttp-socks
 openai
 python-dotenv
 pypdf

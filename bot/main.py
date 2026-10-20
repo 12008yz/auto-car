@@ -17,6 +17,7 @@ from config import (
     BILLING_PUBLIC_BASE_URL,
     LLM_API_KEY,
     TELEGRAM_BOT_TOKEN,
+    TELEGRAM_PROXY,
     UNITPAY_PUBLIC_KEY,
     UNITPAY_SECRET_KEY,
 )
@@ -78,14 +79,34 @@ async def _run() -> None:
                 "UNITPAY_PUBLIC_KEY / UNITPAY_SECRET_KEY не заданы — "
                 "оплата ₽ недоступна до ключей из кабинета UnitPay."
             )
+        from billing.legal_site import merchant_ready
+
+        if not merchant_ready():
+            log.warning(
+                "Реквизиты/домен для UnitPay неполные "
+                "(MERCHANT_* , BOT_USERNAME, BILLING_PUBLIC_BASE_URL) — "
+                "заполните до подачи на модерацию."
+            )
     except OSError as exc:
         log.warning("Billing HTTP server not started: %s", exc)
         runner = None
 
     log.info("Загружаю модель поиска по документам…")
     get_embedder()
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    await bot.set_my_commands(ui.BOT_COMMANDS)
+    session = None
+    if TELEGRAM_PROXY:
+        from aiogram.client.session.aiohttp import AiohttpSession
+
+        session = AiohttpSession(proxy=TELEGRAM_PROXY)
+        log.info("Telegram через прокси: %s", TELEGRAM_PROXY.split("@")[-1])
+    bot = Bot(token=TELEGRAM_BOT_TOKEN, session=session) if session else Bot(
+        token=TELEGRAM_BOT_TOKEN
+    )
+    try:
+        await bot.set_my_commands(ui.BOT_COMMANDS)
+    except Exception as exc:
+        # На части VPS первый запрос к api.telegram.org таймаутит — polling всё равно стартуем.
+        log.warning("set_my_commands не удался (%s) — продолжаю запуск.", exc)
     dp = Dispatcher()
     dp.include_router(billing_router)
     dp.include_router(router)

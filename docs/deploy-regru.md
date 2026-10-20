@@ -84,13 +84,34 @@ sudo systemctl status pybot
 
 ## 5. UnitPay (заявка / касса)
 
-1. В кабинете UnitPay создайте/дозаполните проект (ИП, описание бота, URL).
-2. Payment handler: `https://YOUR_DOMAIN/billing/unitpay`
-3. После одобрения: Управление → Онлайн-кассы → **Юнит.Чеки** (или своя касса).
-4. Ключи → в `.env`, `sudo systemctl restart pybot`.
-5. Тест: `/pay` → тариф → email → оплата → чек на почту → кредиты в `/balance`.
+Перед модерацией UnitPay нужны:
 
-## 6. Что не забыть
+1. Домен + HTTPS на VPS (nginx из `deploy/nginx-pybot.conf` проксирует весь сайт на `:8088`).
+2. В `.env` на сервере реквизиты ИП и бота — шаблон:
+   [`deploy/merchant-for-server.env`](../deploy/merchant-for-server.env)
+   (ИНН/ОГРНИП Чикасова уже проставлены; допиши `BOT_USERNAME`, email, телефон, домен).
+3. Проверка страниц:
+   - `https://ДОМЕН/` — описание и цены  
+   - `/offer` `/privacy` `/refund` `/security` `/payment` `/contacts`  
+   - `https://ДОМЕН/health` → `ok`  
+   - handler: `https://ДОМЕН/billing/unitpay`
+4. В кабинете UnitPay: проект = сайт (этот домен) или Telegram-бот + ссылка на сайт с офертой.
+5. После одобрения: касса **Юнит.Чеки**, ключи `UNITPAY_*` в `.env`, `systemctl restart pybot`.
+6. Тест: `/pay` → email → оплата → чек → `/balance`. В боте также `/legal`.
+
+## 6. Telegram недоступен с VPS (ТСПУ)
+
+Если `curl https://api.telegram.org` таймаутит — это фильтрация, не баг бота.
+
+Бесплатный обход: **Cloudflare WARP** в режиме SOCKS-прокси на `127.0.0.1:40000`, в `.env`:
+
+```env
+TELEGRAM_PROXY=socks5://127.0.0.1:40000
+```
+
+SSH при этом не ломается (прокси только для бота).
+
+## 7. Что не забыть
 
 - Firewall: 80/443 открыты; 8088 снаружи **не** открывать (только localhost).
 - `UNITPAY_SKIP_IP_CHECK` в проде не включать.

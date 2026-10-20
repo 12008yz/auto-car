@@ -10,6 +10,8 @@ DATA_DIR = ROOT / "data" / "users"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# SOCKS5/HTTP прокси до api.telegram.org (напр. Cloudflare WARP: socks5://127.0.0.1:40000)
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.aitunnel.ru/v1").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
@@ -74,6 +76,16 @@ BILLING_ADMIN_IDS = {
 }
 
 STARS_SUBSCRIPTION_PERIOD = 30 * 24 * 60 * 60  # 2592000
+
+# Публичный сайт / реквизиты для модерации UnitPay (см. billing/legal_site.py)
+BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "DocBot").strip() or "DocBot"
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
+MERCHANT_LEGAL_NAME = os.getenv("MERCHANT_LEGAL_NAME", "").strip()
+MERCHANT_INN = os.getenv("MERCHANT_INN", "").strip()
+MERCHANT_OGRNIP = os.getenv("MERCHANT_OGRNIP", "").strip()
+MERCHANT_ADDRESS = os.getenv("MERCHANT_ADDRESS", "").strip()
+MERCHANT_EMAIL = os.getenv("MERCHANT_EMAIL", "").strip()
+MERCHANT_PHONE = os.getenv("MERCHANT_PHONE", "").strip()
 
 # Partner / guide links (ИП на НПД)
 _ALFA_IP_NPD_DEFAULT = "https://alfa.me/AK1Rlb"

@@ -40,6 +40,7 @@ BOT_COMMANDS = [
     BotCommand(command="balance", description="Баланс и лимиты"),
     BotCommand(command="plans", description="Тарифы"),
     BotCommand(command="pay", description="Оплатить тариф"),
+    BotCommand(command="legal", description="Оферта и реквизиты"),
     BotCommand(command="clear", description="Очистить чат, файлы и сессию"),
     BotCommand(command="help", description="Как пользоваться ботом"),
 ]

@@ -38,6 +38,12 @@ def plans_text(lang_ru: bool = True) -> str:
             )
         lines.append("")
         lines.append("Оплатить: /pay или кнопка «Тарифы»")
+        base = (config.BILLING_PUBLIC_BASE_URL or "").rstrip("/")
+        if base and "your_domain" not in base.lower():
+            lines.append("")
+            lines.append(
+                f"Оферта и реквизиты: {base}/ · /legal в боте"
+            )
         return "\n".join(lines)
     lines = [
         "<b>Plans</b>",

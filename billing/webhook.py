@@ -156,10 +156,13 @@ async def health(_request: web.Request) -> web.Response:
 
 
 def create_app() -> web.Application:
+    from billing.legal_site import register_legal_routes
+
     app = web.Application()
     app.router.add_get("/billing/unitpay", unitpay_handler)
     app.router.add_post("/billing/unitpay", unitpay_handler)
     app.router.add_get("/health", health)
+    register_legal_routes(app)
     return app
 
 
