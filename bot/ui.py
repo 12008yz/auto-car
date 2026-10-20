@@ -36,6 +36,7 @@ BOT_COMMANDS = [
     BotCommand(command="card", description="Собрать карточку WB / Ozon"),
     BotCommand(command="files", description="Мои загруженные файлы"),
     BotCommand(command="summary", description="Краткое содержание файла"),
+    BotCommand(command="ip_npd", description="ИП на НПД — бесплатно"),
     BotCommand(command="balance", description="Баланс и лимиты"),
     BotCommand(command="plans", description="Тарифы"),
     BotCommand(command="pay", description="Оплатить тариф"),
@@ -165,7 +166,7 @@ def ip_npd_keyboard(step_id: str) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Заявка в Альфе — ссылка бота",
+                    text="Заявка в Альфе — только ссылка бота",
                     url=alfa_url(),
                 )
             ]
@@ -196,7 +197,7 @@ def ip_npd_keyboard(step_id: str) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Заявка в Альфе — ссылка бота",
+                    text="Заявка в Альфе — только ссылка бота",
                     url=alfa_url(),
                 )
             ]
@@ -280,8 +281,9 @@ def soft_landing_keyboard(*, has_files: bool) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="Меню документов", callback_data="menu:docs"),
-                InlineKeyboardButton(text="« В меню", callback_data="menu:home"),
+                InlineKeyboardButton(text="ИП на НПД", callback_data="menu:ip_npd"),
             ],
+            [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
         ]
     else:
         rows = [
@@ -292,6 +294,12 @@ def soft_landing_keyboard(*, has_files: bool) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="Документы", callback_data="menu:docs"),
                 InlineKeyboardButton(text="Карточка", callback_data="menu:card"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BTN_IP_NPD,
+                    callback_data="menu:ip_npd",
+                ),
             ],
             [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
         ]
@@ -350,6 +358,20 @@ def back_home_inline() -> InlineKeyboardMarkup:
     )
 
 
+def help_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=BTN_IP_NPD,
+                    callback_data="menu:ip_npd",
+                ),
+            ],
+            [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
+        ]
+    )
+
+
 def clear_confirm_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -383,8 +405,8 @@ def welcome_text(name: str | None = None) -> str:
         "<b>Быстрый старт</b>\n"
         "1. «Карточка» — фото, видео или описание товара\n"
         "2. «Документы» — разобрать файл, поправить Word или создать новый\n"
-        "3. «ИП на НПД» — открыть бесплатно, без деклараций (мастер)\n\n"
-        "Меню всегда внизу экрана."
+        f"3. «{BTN_IP_NPD}» — мастер открытия ИП\n\n"
+        "Меню — кнопки под этим сообщением и внизу экрана."
     )
 
 
@@ -410,8 +432,12 @@ def help_text() -> str:
         "• оформить по образцу\n"
         "• создать: бланк, реферат, письмо, претензия, КП\n"
         "• деловые черновики: договор · акт · счёт · претензия · письмо\n"
-        "• официальные бланки ФНС: «официальный бланк Р21001», «декларация УСН»\n"
-        "• открыть ИП на НПД: кнопка в меню — бесплатно, без деклараций\n\n"
+        "• официальные бланки ФНС: «официальный бланк Р21001», «декларация УСН»\n\n"
+        f"<b>ИП на НПД</b>\n"
+        f"Кнопка «{BTN_IP_NPD}» в меню, раздел «Документы» "
+        "или команда /ip_npd.\n"
+        "Бесплатный мастер: Альфа → Точка → проверка НПД. "
+        "Бот не подаёт заявку за вас — только ведёт по шагам.\n\n"
         "Форматы: Word · PDF · Excel · PowerPoint · TXT · MD · CSV\n"
         f"{billing_line}\n\n"
         "/clear · /use имя_файла"

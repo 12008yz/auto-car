@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import BaseFilter, Command
 from aiogram.types import (
     CallbackQuery,
     Message,
@@ -25,10 +25,27 @@ from billing.service import (
     get_rail,
 )
 from billing.skus import SKUS, Rail, get_sku
+from billing.unitpay import is_valid_email
 from bot import ui
+from bot.session import get_session
+from bot.session_store import save_dialog_session
 from config import BILLING_ADMIN_IDS
 
 router = Router(name="billing")
+
+
+class _AwaitingPayEmail(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        if message.from_user is None or not message.text:
+            return False
+        text = message.text.strip()
+        # Кнопки меню и команды обрабатывает bot.handlers — не перехватываем.
+        if text.startswith("/") or text in ui.REPLY_BUTTONS:
+            return False
+        session = get_session(message.from_user.id)
+        return bool(
+            session.flow == "awaiting_pay_email" and session.pending_unitpay_sku
+        )
 
 
 def _lang_ru(message_or_user_lang: str | None, rail: Rail | None = None) -> bool:
@@ -143,19 +160,27 @@ async def on_pay_sku(query: CallbackQuery) -> None:
     await query.answer()
 
     if rail == "unitpay":
+        session = get_session(uid)
+        session.pending_unitpay_sku = sku_id
+        session.flow = "awaiting_pay_email"
         try:
-            url = start_unitpay_order(uid, sku_id, lang)
-        except Exception as exc:
-            if isinstance(query.message, Message):
-                await query.message.answer(f"UnitPay недоступен: {exc}")
-            return
-        text = (
-            f"Оплата UnitPay:\n{url}\n\nПосле оплаты кредиты/Pro появятся автоматически."
-            if _lang_ru(lang, "unitpay")
-            else f"UnitPay checkout:\n{url}\n\nCredits/Pro will unlock after payment."
-        )
+            save_dialog_session(session)
+        except Exception:
+            pass
+        if _lang_ru(lang, "unitpay"):
+            ask = (
+                "Для чека 54‑ФЗ нужен <b>email</b>.\n"
+                f"Тариф: <b>{get_sku(sku_id).title_ru}</b>.\n"
+                "Напишите адрес почты одним сообщением (или «отмена»)."
+            )
+        else:
+            ask = (
+                "Email is required for the fiscal receipt.\n"
+                f"Plan: <b>{get_sku(sku_id).title_en}</b>.\n"
+                "Send your email in one message (or «cancel»)."
+            )
         if isinstance(query.message, Message):
-            await query.message.answer(text)
+            await query.message.answer(ask, parse_mode="HTML")
         return
 
     # Stars
@@ -176,6 +201,64 @@ async def on_pay_sku(query: CallbackQuery) -> None:
             await query.message.answer_invoice(**kwargs)
     except Exception as exc:
         await query.message.answer(f"Stars invoice error: {exc}")
+
+
+@router.message(F.text, _AwaitingPayEmail())
+async def on_unitpay_email(message: Message) -> None:
+    """Email для чека UnitPay (только в режиме awaiting_pay_email)."""
+    if message.from_user is None or not message.text:
+        return
+    session = get_session(message.from_user.id)
+    lang = message.from_user.language_code
+    ru = _lang_ru(lang, "unitpay")
+    text = message.text.strip()
+    low = text.lower()
+    if low in {"отмена", "cancel", "/cancel"}:
+        session.pending_unitpay_sku = None
+        session.flow = "idle"
+        try:
+            save_dialog_session(session)
+        except Exception:
+            pass
+        await message.answer("Оплата отменена." if ru else "Payment cancelled.")
+        return
+    if not is_valid_email(text):
+        await message.answer(
+            "Похоже, это не email. Пришлите вида name@mail.ru или «отмена»."
+            if ru
+            else "That doesn’t look like an email. Send name@mail.com or «cancel»."
+        )
+        return
+    sku_id = session.pending_unitpay_sku or ""
+    session.pending_unitpay_sku = None
+    session.flow = "idle"
+    try:
+        save_dialog_session(session)
+    except Exception:
+        pass
+    try:
+        url = start_unitpay_order(
+            message.from_user.id,
+            sku_id,
+            lang,
+            customer_email=text,
+        )
+    except Exception as exc:
+        await message.answer(f"UnitPay недоступен: {exc}")
+        return
+    if ru:
+        body = (
+            f"Оплата UnitPay:\n{url}\n\n"
+            f"Чек придёт на <b>{text}</b>. "
+            "После оплаты кредиты/Pro появятся автоматически."
+        )
+    else:
+        body = (
+            f"UnitPay checkout:\n{url}\n\n"
+            f"Receipt will be sent to <b>{text}</b>. "
+            "Credits/Pro unlock after payment."
+        )
+    await message.answer(body, parse_mode="HTML")
 
 
 @router.pre_checkout_query()

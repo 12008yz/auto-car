@@ -14,7 +14,7 @@
 ## Non-goals
 
 - Changing UnitPay / Stars payment rails.
-- Turning off `BILLING_OPEN_ACCESS` in this change set (document only: must be off before public sell).
+- `BILLING_OPEN_ACCESS` default is **off** (`0`); daily FREE_DAILY caps apply in production.
 - Redesigning SKU prices in RUB/Stars (keep current SKUs unless noted).
 - Multi-currency accounting beyond existing rails.
 

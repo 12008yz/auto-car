@@ -1,0 +1,18 @@
+# Для VPS без GPU (Reg.ru и т.п.). Локально с CUDA — requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+torchaudio
+python-docx
+transformers
+sentence-transformers
+aiogram
+aiohttp
+openai
+python-dotenv
+pypdf
+openpyxl
+python-pptx
+pillow
+rembg
+onnxruntime

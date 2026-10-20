@@ -1,11 +1,45 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import re
 from typing import Any
 from urllib.parse import urlencode
 
 import config
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_valid_email(value: str) -> bool:
+    return bool(_EMAIL_RE.match((value or "").strip()))
+
+
+def encode_cash_items(
+    *,
+    name: str,
+    price: float,
+    count: int = 1,
+    nds: str = "none",
+    item_type: str = "service",
+    payment_method: str = "full_payment",
+    currency: str = "RUB",
+) -> str:
+    """Base64 JSON for UnitPay cashItems (before URL-encoding)."""
+    payload = [
+        {
+            "name": (name or "Услуга")[:128],
+            "count": count,
+            "price": float(price),
+            "currency": currency,
+            "nds": nds,
+            "type": item_type,
+            "paymentMethod": payment_method,
+        }
+    ]
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
 
 # Official UnitPay callback source IPs (from UnitPay PHP SDK / docs)
 UNITPAY_IPS = frozenset(
@@ -64,6 +98,10 @@ def build_payment_url(
     sum_value: float,
     desc: str,
     currency: str = "RUB",
+    customer_email: str | None = None,
+    receipt_name: str | None = None,
+    receipt_nds: str | None = None,
+    receipt_type: str = "service",
 ) -> str:
     if not config.UNITPAY_PUBLIC_KEY:
         raise RuntimeError("UNITPAY_PUBLIC_KEY is not set")
@@ -71,16 +109,25 @@ def build_payment_url(
         raise RuntimeError("UNITPAY_SECRET_KEY is not set")
     sum_str = _format_sum(sum_value)
     signature = form_signature(account, currency, desc, sum_str)
-    query = urlencode(
-        {
-            "sum": sum_str,
-            "account": account,
-            "desc": desc,
-            "currency": currency,
-            "signature": signature,
-        },
-        encoding="utf-8",
-    )
+    params: dict[str, str] = {
+        "sum": sum_str,
+        "account": account,
+        "desc": desc,
+        "currency": currency,
+        "signature": signature,
+    }
+    email = (customer_email or "").strip()
+    if email:
+        params["customerEmail"] = email
+        nds = (receipt_nds or config.UNITPAY_RECEIPT_NDS or "none").strip() or "none"
+        params["cashItems"] = encode_cash_items(
+            name=(receipt_name or desc or "Услуга"),
+            price=float(sum_value),
+            nds=nds,
+            item_type=receipt_type,
+            currency=currency,
+        )
+    query = urlencode(params, encoding="utf-8")
     return f"https://unitpay.ru/pay/{config.UNITPAY_PUBLIC_KEY}?{query}"
 
 

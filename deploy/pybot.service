@@ -1,0 +1,20 @@
+[Unit]
+Description=pyBot Telegram + UnitPay billing
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/pyBot
+Environment=PYTHONUTF8=1
+EnvironmentFile=/opt/pyBot/.env
+ExecStart=/opt/pyBot/.venv/bin/python /opt/pyBot/main.py
+Restart=on-failure
+RestartSec=5
+
+# Нужны исходящий HTTPS (Telegram, LLM, UnitPay) и входящий на порт billing
+# (или только localhost, если стоит nginx).
+
+[Install]
+WantedBy=multi-user.target

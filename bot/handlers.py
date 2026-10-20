@@ -495,6 +495,19 @@ def _refund(
     refund_consume(actor.id, charge, action)
 
 
+async def _answer_home(message: Message, name: str | None = None) -> None:
+    """Главное меню: inline под приветствием + нижняя клавиатура."""
+    await message.answer(
+        ui.welcome_text(name),
+        parse_mode="HTML",
+        reply_markup=ui.home_inline(),
+    )
+    await message.answer(
+        "Кнопки внизу экрана тоже обновлены.",
+        reply_markup=ui.main_reply_keyboard(),
+    )
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     session = _session_of(message.from_user)
@@ -503,11 +516,7 @@ async def cmd_start(message: Message) -> None:
     if message.from_user:
         ensure_user(message.from_user.id, message.from_user.language_code)
     name = message.from_user.first_name if message.from_user else None
-    await message.answer(
-        ui.welcome_text(name),
-        parse_mode="HTML",
-        reply_markup=ui.main_reply_keyboard(),
-    )
+    await _answer_home(message, name)
 
 
 @router.message(Command("help"))
@@ -515,7 +524,7 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         ui.help_text(),
         parse_mode="HTML",
-        reply_markup=ui.back_home_inline(),
+        reply_markup=ui.help_inline(),
     )
 
 
@@ -524,13 +533,18 @@ async def cmd_menu(message: Message) -> None:
     session = _session_of(message.from_user)
     if session is not None:
         session.clear_dialog_modes()
-    await message.answer(
-        ui.welcome_text(
-            message.from_user.first_name if message.from_user else None
-        ),
-        parse_mode="HTML",
-        reply_markup=ui.main_reply_keyboard(),
+    await _answer_home(
+        message,
+        message.from_user.first_name if message.from_user else None,
     )
+
+
+@router.message(Command("ip_npd"))
+async def cmd_ip_npd(message: Message) -> None:
+    session = _session_of(message.from_user)
+    if session is not None:
+        session.clear_dialog_modes()
+    await _send_ip_npd_step(message, "why")
 
 
 @router.message(Command("clear"))
@@ -570,6 +584,10 @@ async def on_menu_button(message: Message) -> None:
     session = _session_of(message.from_user)
     if session is None:
         return
+    # Уход в меню сбрасывает ожидание email для оплаты
+    if session.flow == "awaiting_pay_email":
+        session.pending_unitpay_sku = None
+        session.flow = "idle"
     if text == ui.BTN_HELP:
         session.clear_dialog_modes(keep_pending=True)
         await cmd_help(message)
@@ -623,11 +641,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
 
     if action == "home":
         session.clear_dialog_modes()
-        await query.message.answer(
-            ui.welcome_text(query.from_user.first_name),
-            parse_mode="HTML",
-            reply_markup=ui.main_reply_keyboard(),
-        )
+        await _answer_home(query.message, query.from_user.first_name)
         return
     if action == "clear_no":
         try:
@@ -653,9 +667,15 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             chat_id,
             ui.welcome_text(query.from_user.first_name),
             parse_mode="HTML",
-            reply_markup=ui.main_reply_keyboard(),
+            reply_markup=ui.home_inline(),
         )
         _remember_bot_message(query.from_user.id, sent)
+        menu_sent = await query.bot.send_message(
+            chat_id,
+            "Кнопки внизу экрана тоже обновлены.",
+            reply_markup=ui.main_reply_keyboard(),
+        )
+        _remember_bot_message(query.from_user.id, menu_sent)
         try:
             save_dialog_session(get_session(query.from_user.id))
         except Exception:
@@ -666,7 +686,7 @@ async def on_menu_callback(query: CallbackQuery) -> None:
         await query.message.answer(
             ui.help_text(),
             parse_mode="HTML",
-            reply_markup=ui.back_home_inline(),
+            reply_markup=ui.help_inline(),
         )
         return
     if action == "ip_npd":
@@ -1132,6 +1152,9 @@ async def on_text(message: Message) -> None:
         return
     session = _session_of(message.from_user)
     if session is None:
+        return
+    # Email для UnitPay обрабатывает billing.handlers
+    if session.flow == "awaiting_pay_email" and session.pending_unitpay_sku:
         return
 
     low = text.lower()

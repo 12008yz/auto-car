@@ -173,11 +173,41 @@ def upsell_keyboard(telegram_id: int, language_code: str | None = None) -> Inlin
     return pay_keyboard(rail, lang_ru)
 
 
-def start_unitpay_order(telegram_id: int, sku_id: str, language_code: str | None = None) -> str:
+def _public_base_ready() -> bool:
+    base = (config.BILLING_PUBLIC_BASE_URL or "").strip().rstrip("/")
+    if not base.lower().startswith("https://"):
+        return False
+    host = base.split("://", 1)[-1].split("/")[0].lower().split(":")[0]
+    if not host or host in {"your_domain", "localhost", "127.0.0.1"}:
+        return False
+    if host.startswith("your_") or host.endswith(".local"):
+        return False
+    return True
+
+
+def start_unitpay_order(
+    telegram_id: int,
+    sku_id: str,
+    language_code: str | None = None,
+    *,
+    customer_email: str | None = None,
+) -> str:
     if not config.UNITPAY_PUBLIC_KEY or not config.UNITPAY_SECRET_KEY:
         raise RuntimeError(
             "UnitPay не настроен. Заполните UNITPAY_PUBLIC_KEY и UNITPAY_SECRET_KEY в .env"
         )
+    if not _public_base_ready():
+        raise RuntimeError(
+            "Не задан рабочий BILLING_PUBLIC_BASE_URL (нужен https://ваш-домен "
+            "без placeholder YOUR_DOMAIN — см. docs/deploy-regru.md)."
+        )
+    email = (customer_email or "").strip()
+    if not email:
+        raise RuntimeError("Для чека 54-ФЗ нужен email покупателя.")
+    from billing.unitpay import is_valid_email
+
+    if not is_valid_email(email):
+        raise RuntimeError("Некорректный email для чека.")
     order = create_order(telegram_id, sku_id, "unitpay", language_code)
     mark_order_pending(order["order_id"])
     sku = order["sku_obj"]
@@ -187,6 +217,9 @@ def start_unitpay_order(telegram_id: int, sku_id: str, language_code: str | None
         sum_value=float(order["amount"]),
         desc=desc,
         currency="RUB",
+        customer_email=email,
+        receipt_name=desc,
+        receipt_nds=config.UNITPAY_RECEIPT_NDS,
     )
 
 

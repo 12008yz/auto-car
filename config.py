@@ -44,8 +44,9 @@ ALLOWED_SUFFIXES = {
 BILLING_DB_PATH = Path(
     os.getenv("BILLING_DB_PATH", str(ROOT / "data" / "billing.sqlite3"))
 )
-# Пока открытый доступ: без Pro и без списания лимитов (вернуть False перед продакшеном)
-BILLING_OPEN_ACCESS = os.getenv("BILLING_OPEN_ACCESS", "1").strip().lower() in {
+# Открытый доступ без лимитов (только для тестов). По умолчанию выключен —
+# действуют дневные FREE_DAILY из billing/skus.py.
+BILLING_OPEN_ACCESS = os.getenv("BILLING_OPEN_ACCESS", "0").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -63,6 +64,8 @@ UNITPAY_SKIP_IP_CHECK = os.getenv("UNITPAY_SKIP_IP_CHECK", "").strip() in {
     "true",
     "yes",
 }
+# НДС в чеке UnitPay: для ИП на НПД обычно none (без НДС)
+UNITPAY_RECEIPT_NDS = os.getenv("UNITPAY_RECEIPT_NDS", "none").strip() or "none"
 
 # Optional admin telegram ids for test grants: "123,456"
 _ADMIN_RAW = os.getenv("BILLING_ADMIN_IDS", "").strip()
@@ -73,7 +76,7 @@ BILLING_ADMIN_IDS = {
 STARS_SUBSCRIPTION_PERIOD = 30 * 24 * 60 * 60  # 2592000
 
 # Partner / guide links (ИП на НПД)
-_ALFA_IP_NPD_DEFAULT = "https://alfabank.sale/sme/agent/start/ip-npd/"
+_ALFA_IP_NPD_DEFAULT = "https://alfa.me/AK1Rlb"
 _TOCHKA_RKO_DEFAULT = "https://tochka.com/"
 _MY_NALOG_DEFAULT = "https://npd.nalog.ru/"
 _FNS_IP_REG_DEFAULT = "https://service.nalog.ru/gosreg/index.html"

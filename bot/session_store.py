@@ -74,6 +74,7 @@ def session_to_payload(session: UserSession) -> dict[str, Any]:
         "last_op": session.last_op,
         "card_mode": bool(session.card_mode),
         "awaiting_gap_fill": bool(session.awaiting_gap_fill),
+        "pending_unitpay_sku": session.pending_unitpay_sku,
         "active_path": str(session.active_path) if session.active_path else None,
         "pending": pending,
         "pending_clarify": clarify,
@@ -88,6 +89,8 @@ def apply_payload(session: UserSession, payload: dict[str, Any]) -> None:
     session.last_op = str(payload.get("last_op") or "")
     session.card_mode = bool(payload.get("card_mode"))
     session.awaiting_gap_fill = bool(payload.get("awaiting_gap_fill"))
+    sku = payload.get("pending_unitpay_sku")
+    session.pending_unitpay_sku = str(sku) if sku else None
 
     active = payload.get("active_path")
     if active:

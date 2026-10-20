@@ -64,7 +64,9 @@ class UserSession:
     doc_task: DocTask | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     card_mode: bool = False
-    # idle | awaiting_confirm | clarifying | awaiting_write
+    # Ожидание email для чека UnitPay (sku_id тарифа)
+    pending_unitpay_sku: str | None = None
+    # idle | awaiting_confirm | clarifying | awaiting_write | awaiting_pay_email
     flow: str = "idle"
     # fill | patch | tone | rewrite | reverse_words | ask | write | check | …
     last_op: str = ""
@@ -112,6 +114,7 @@ class UserSession:
         self.pending_clarify = None
         self.business_draft = None
         self.awaiting_gap_fill = False
+        self.pending_unitpay_sku = None
         self.last_op = ""
         if not keep_card_mode:
             self.card_mode = False

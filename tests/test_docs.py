@@ -664,8 +664,10 @@ class TestUiWiring(unittest.TestCase):
         }
         self.assertIn("docs:go:ask", with_files)
         self.assertIn("docs:go:fill", with_files)
+        self.assertIn("menu:ip_npd", with_files)
         self.assertIn("docs:go:need_file", without)
         self.assertIn("docs:go:write_text", without)
+        self.assertIn("menu:ip_npd", without)
         self.assertTrue(ui.interpret_confirm_text("тест").startswith("Ок:"))
         self.assertEqual(
             ui.interpret_confirm_text("Сейчас посмотрю в файле…"),

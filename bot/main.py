@@ -17,6 +17,8 @@ from config import (
     BILLING_PUBLIC_BASE_URL,
     LLM_API_KEY,
     TELEGRAM_BOT_TOKEN,
+    UNITPAY_PUBLIC_KEY,
+    UNITPAY_SECRET_KEY,
 )
 from rag.pipeline import get_embedder
 
@@ -64,6 +66,18 @@ async def _run() -> None:
             BILLING_HTTP_HOST,
             BILLING_HTTP_PORT,
         )
+        from billing.pay import _public_base_ready
+
+        if not _public_base_ready():
+            log.warning(
+                "BILLING_PUBLIC_BASE_URL не готов (нужен реальный https://домен) — "
+                "см. docs/deploy-regru.md."
+            )
+        if not UNITPAY_PUBLIC_KEY or not UNITPAY_SECRET_KEY:
+            log.warning(
+                "UNITPAY_PUBLIC_KEY / UNITPAY_SECRET_KEY не заданы — "
+                "оплата ₽ недоступна до ключей из кабинета UnitPay."
+            )
     except OSError as exc:
         log.warning("Billing HTTP server not started: %s", exc)
         runner = None

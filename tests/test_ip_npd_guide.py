@@ -21,6 +21,12 @@ class TestIpNpdGuide(unittest.TestCase):
         self.assertIn("декларац", joined)
         self.assertIn("кнопкой ниже", joined)
         self.assertIn("гид по ип бесплатный", joined)
+        self.assertIn("ип на нпд", joined)
+        self.assertIn("партнёрск", joined)
+        self.assertIn("не соглашайтесь на", joined)
+        self.assertIn("усн", joined)
+        self.assertIn("системы налогообложения", joined)
+        self.assertIn("alfa.me", alfa_url().lower())
 
     def test_partner_cta_buttons(self) -> None:
         from bot import ui
@@ -83,6 +89,38 @@ class TestIpNpdGuide(unittest.TestCase):
         self.assertIn("бесплатно", ui.BTN_IP_NPD.lower())
         help_l = ui.help_text().lower()
         self.assertIn("ип на нпд", help_l)
+        self.assertIn("/ip_npd", help_l)
+        self.assertIn(ui.BTN_IP_NPD.lower(), help_l)
+        help_cbs = {
+            b.callback_data
+            for row in ui.help_inline().inline_keyboard
+            for b in row
+            if b.callback_data
+        }
+        self.assertIn("menu:ip_npd", help_cbs)
+        cmds = {c.command for c in ui.BOT_COMMANDS}
+        self.assertIn("ip_npd", cmds)
+        soft_yes = {
+            b.callback_data
+            for row in ui.soft_landing_keyboard(has_files=True).inline_keyboard
+            for b in row
+            if b.callback_data
+        }
+        soft_no = {
+            b.callback_data
+            for row in ui.soft_landing_keyboard(has_files=False).inline_keyboard
+            for b in row
+            if b.callback_data
+        }
+        self.assertIn("menu:ip_npd", soft_yes)
+        self.assertIn("menu:ip_npd", soft_no)
+        docs = {
+            b.callback_data
+            for row in ui.docs_inline().inline_keyboard
+            for b in row
+            if b.callback_data
+        }
+        self.assertIn("menu:ip_npd", docs)
 
 
 if __name__ == "__main__":
