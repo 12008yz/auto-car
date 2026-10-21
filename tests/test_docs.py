@@ -19,6 +19,7 @@ class TestSyntax(unittest.TestCase):
     def test_core_modules_parse(self) -> None:
         files = [
             "bot/handlers.py",
+            "bot/route.py",
             "bot/ui.py",
             "bot/session.py",
             "bot/session_store.py",

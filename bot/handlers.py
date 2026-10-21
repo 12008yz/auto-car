@@ -99,6 +99,7 @@ from llm.client import (
     refine_document_intent_llm,
     summarize_document,
 )
+from bot.route import TextRouteContext, resolve_text_route
 from bot.session_store import save_dialog_session
 from rag.pipeline import Hit, chunk_blocks
 
@@ -1278,6 +1279,41 @@ async def on_text(message: Message) -> None:
             )
             return
 
+    # Режим «Карточка» — до chitchat/классификатора (короткое «Стол» ≠ вопрос по файлу).
+    if session.card_mode and session.pending is None and session.flow != "awaiting_confirm":
+        route = resolve_text_route(
+            text,
+            TextRouteContext(
+                card_mode=True,
+                has_files=bool(session.index.files),
+                has_facts=bool(session.doc_task and session.doc_task.facts),
+                awaiting_gap_fill=session.awaiting_gap_fill,
+            ),
+        )
+        if route.action == "cancel_card":
+            session.card_mode = False
+            await message.answer(
+                "Ок, карточку отменил.",
+                reply_markup=ui.main_reply_keyboard(),
+            )
+            return
+        if route.action == "exit_card_menu":
+            session.card_mode = False
+            await message.answer(
+                "Ок. Могу сделать карточку, разобрать документ или создать Word.\n"
+                "Нажмите нужную кнопку в меню.",
+                reply_markup=ui.main_reply_keyboard(),
+            )
+            return
+        if route.action == "card":
+            charge = await _require_quota(message, "card")
+            if charge is None:
+                return
+            await _make_card(message, session, text, None, charge)
+            return
+        if route.clear_card_mode:
+            session.card_mode = False
+
     # Привет / small-talk — не требуем файл
     if looks_like_chitchat(text) and not (
         looks_like_edit(text) or looks_like_fill_data(text) or detect_transform(text)
@@ -1375,7 +1411,7 @@ async def on_text(message: Message) -> None:
         await _handle_edit(message, session, instruction, mode="fill")
         return
 
-    # Документная задача сильнее залипшего card_mode
+    # Документные интенты (card_mode уже снят выше при входе в карточку/override)
     if intent in {
         "edit",
         "ask",
@@ -1509,13 +1545,12 @@ async def on_text(message: Message) -> None:
         await _handle_question(message, session, text)
         return
 
-    # Карточка: кнопка «Карточка» или явный товарный запрос
-    if session.card_mode or intent == "card" or looks_like_card(text):
-        if len(text) < 12:
+    # Карточка: явный товарный запрос (card_mode уже обработан выше)
+    if intent == "card" or looks_like_card(text):
+        if len(text.strip()) < 2:
             await message.answer(
-                "Для карточки нужно описание товара (хотя бы пару слов) "
-                "или фото/видео.\n"
-                "Пример: «Нужно продать керамическую кружку 300 мл».",
+                "Для карточки нужно название/описание товара или фото/видео.\n"
+                "Пример: «Стол» или «керамическая кружка 300 мл».",
                 reply_markup=ui.card_inline(),
             )
             return
