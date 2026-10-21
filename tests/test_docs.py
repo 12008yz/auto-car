@@ -134,6 +134,20 @@ class TestIntentRouter(unittest.TestCase):
                 self.assertFalse(self.looks_like_fill_data(text))
                 self.assertEqual(self._intent(text, has_files=True), "ask")
 
+    def test_fio_verification_with_facts_still_ask(self) -> None:
+        """После fill «верно ли ФИО?» не должен уходить в facts_followup → edit."""
+        for text in ("Верно ли ФИО?", "Можно проверить ФИО?"):
+            with self.subTest(text=text):
+                d = self.classify(text, has_files=True, has_facts=True)
+                self.assertEqual(d["intent"], "ask")
+                self.assertNotEqual(d.get("guard"), "facts_followup")
+
+    def test_long_address_gap_fill(self) -> None:
+        text = "Тульская область, г. Богородицк, ул. Ленина 1"
+        d = self.classify(text, has_files=True, awaiting_gap_fill=True)
+        self.assertEqual(d["intent"], "gap_fill")
+        self.assertEqual(d.get("mode"), "fill")
+
     def test_past_tense_create_with_files_is_write(self) -> None:
         text = "Мне нужно чтобы ты написал реферат про медицину"
         self.assertEqual(self._intent(text, has_files=True), "write_text")

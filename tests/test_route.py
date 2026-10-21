@@ -43,6 +43,19 @@ ROUTE_CASES: list[tuple[dict, str, str, str]] = [
         "dispatch",
         "gap_fill",
     ),
+    # gap-fill важнее залипшей карточки
+    (
+        {"card_mode": True, "has_files": True, "awaiting_gap_fill": True},
+        "Богородицк",
+        "dispatch",
+        "gap_fill",
+    ),
+    (
+        {"has_files": True, "awaiting_gap_fill": True},
+        "Тульская область, г. Богородицк, ул. Ленина 1",
+        "dispatch",
+        "gap_fill",
+    ),
     (
         {"has_files": True},
         "Проверь договор на риски",

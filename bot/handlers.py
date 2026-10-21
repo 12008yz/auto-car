@@ -1263,6 +1263,11 @@ async def on_text(message: Message) -> None:
         and session.business_draft is None
     ):
         opts = list(session.pending_clarify.options or [])
+        if low in {"отмена", "cancel", "отменить", "стоп"}:
+            session.pending_clarify = None
+            session.flow = "idle"
+            await message.answer("Ок, отменил.", reply_markup=ui.main_reply_keyboard())
+            return
         if any(str(o.get("id") or "").startswith("biz:") for o in opts):
             base = (session.pending_clarify.prompt or "").strip()
             combined = f"{base}\n{text}".strip() if base else text
@@ -1276,6 +1281,64 @@ async def on_text(message: Message) -> None:
                 "Выберите тип кнопкой или напишите задачу целиком, "
                 "например: «Составь договор услуг с ООО Ромашка на 80 000 руб.»",
                 reply_markup=ui.business_kind_keyboard(),
+            )
+            return
+        # «Да» / «ок» вместо кнопки «Да, делай» / soft landing
+        if low in {
+            "да",
+            "давай",
+            "ок",
+            "хорошо",
+            "согласен",
+            "согласна",
+            "yes",
+            "ok",
+            "угу",
+            "ага",
+            "делай",
+            "да, делай",
+            "да делай",
+        } and opts:
+            action = str(opts[0].get("id") or "").strip()
+            pending = session.pending_clarify
+            prompt = (pending.prompt if pending else "") or ""
+            session.pending_clarify = None
+            session.flow = "idle"
+            if action in {"write_form", "write_text"}:
+                mode = "form" if action == "write_form" else "text"
+                if not prompt.strip():
+                    session.flow = "awaiting_write"
+                    session.last_op = action
+                    await message.answer(
+                        "Ок, создам документ. Напишите тему или задачу одним сообщением.",
+                        reply_markup=ui.docs_inline(),
+                    )
+                    return
+                charge = await _require_quota(message, "write")
+                if charge is None:
+                    return
+                session.remember_doc_task("write", prompt)
+                await _handle_write(message, session, prompt, charge, mode=mode)
+                return
+            if action == "ask" and prompt:
+                if not await _require_files(message, session):
+                    return
+                session.remember_doc_task("ask", prompt)
+                await _handle_question(message, session, prompt)
+                return
+            if action == "fill" and prompt:
+                if not await _require_files(message, session):
+                    return
+                await _handle_edit(message, session, prompt, mode="fill")
+                return
+            if action == "edit" and prompt:
+                if not await _require_files(message, session):
+                    return
+                await _handle_edit(message, session, prompt, mode="auto")
+                return
+            await message.answer(
+                "Нажмите кнопку под сообщением или перефразируйте задачу.",
+                reply_markup=ui.docs_inline(),
             )
             return
 
@@ -1314,9 +1377,14 @@ async def on_text(message: Message) -> None:
         if route.clear_card_mode:
             session.card_mode = False
 
-    # Привет / small-talk — не требуем файл
-    if looks_like_chitchat(text) and not (
-        looks_like_edit(text) or looks_like_fill_data(text) or detect_transform(text)
+    # Привет / small-talk — не требуем файл (не перебиваем план правок / confirm)
+    if (
+        looks_like_chitchat(text)
+        and not (
+            looks_like_edit(text) or looks_like_fill_data(text) or detect_transform(text)
+        )
+        and session.pending is None
+        and session.flow != "awaiting_confirm"
     ):
         await message.answer(
             "Привет! Могу разобрать документ, заполнить бланк или создать Word-файл.\n"
@@ -1396,6 +1464,8 @@ async def on_text(message: Message) -> None:
                 refine_document_intent_llm,
                 text,
                 has_files=has_files,
+                has_facts=has_facts,
+                awaiting_gap_fill=session.awaiting_gap_fill,
                 heuristic=decision,
             )
             intent = str(decision.get("intent") or "none")

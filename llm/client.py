@@ -1118,12 +1118,17 @@ def looks_like_chitchat(text: str) -> bool:
 
 
 def looks_like_short_gap_value(text: str) -> bool:
-    """Короткий ответ на «укажите адрес/город» после проверки пустых полей."""
+    """Ответ на «укажите адрес/город/ФИО» после проверки пустых полей.
+
+    Допускает короткий город и полный адрес (область, улица, дом).
+    """
     raw = (text or "").strip()
-    if not raw or len(raw) > 70:
+    if not raw or len(raw) > 140:
         return False
     lowered = raw.lower()
     if looks_like_chitchat(raw) or looks_like_apply_pending(raw):
+        return False
+    if looks_like_doc_question(raw):
         return False
     if any(
         k in lowered
@@ -1139,15 +1144,15 @@ def looks_like_short_gap_value(text: str) -> bool:
         )
     ):
         return False
-    if looks_like_edit(lowered) and not any(
-        k in lowered for k in ("вставь", "добав", "заполни", "подставь")
-    ):
-        # чистое значение без глагола правки
-        pass
     words = raw.split()
-    if len(words) > 6:
+    if len(words) > 14:
         return False
-    return bool(re.fullmatch(r"[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё\-\s.,/]{0,68}", raw))
+    return bool(
+        re.fullmatch(
+            r"[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё\-\s.,/№()]{0,138}",
+            raw,
+        )
+    )
 
 
 def looks_like_tone(text: str) -> bool:
@@ -1327,9 +1332,12 @@ def apply_document_routing_guards(
             }
 
         # 0b) Накопленные факты + «вставь/добавь» → fill
+        # Не перехватывать вопросы («Верно ли ФИО?») — даже если в тексте есть «фио».
         if (
             has_facts
             and any(k in lowered for k in _FACTS_FOLLOWUP_KEYS)
+            and not questionish
+            and "?" not in (text or "")
             and not looks_like_reverse_words(lowered)
             and not transform_op
         ):
@@ -1515,6 +1523,8 @@ def refine_document_intent_llm(
     text: str,
     *,
     has_files: bool = False,
+    has_facts: bool = False,
+    awaiting_gap_fill: bool = False,
     heuristic: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """LLM-уточнение, когда эвристика дала none / низкую уверенность."""
@@ -1591,8 +1601,8 @@ def refine_document_intent_llm(
         out,
         text=text,
         has_files=has_files,
-        has_facts=False,
-        awaiting_gap_fill=False,
+        has_facts=has_facts,
+        awaiting_gap_fill=awaiting_gap_fill,
     )
 
 

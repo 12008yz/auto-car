@@ -17,6 +17,7 @@ from llm.client import (
     looks_like_edit,
     looks_like_fill_data,
     looks_like_reverse_words,
+    looks_like_short_gap_value,
 )
 
 CANCEL_CARD = frozenset({"отмена", "cancel", "отменить", "стоп"})
@@ -63,12 +64,20 @@ def resolve_text_route(text: str, ctx: TextRouteContext) -> TextRoute:
             and not _wants_doc_override(text)
         ):
             return TextRoute(action="exit_card_menu", clear_card_mode=True)
-        if not _wants_doc_override(text):
+        # После «что не заполнено» значение поля важнее названия товара
+        if (
+            ctx.awaiting_gap_fill
+            and looks_like_short_gap_value(text)
+            and not _wants_doc_override(text)
+        ):
+            clear_from_card = True
+        elif not _wants_doc_override(text):
             # on_text уже отсекает пустые строки; защита для прямых вызовов
             if not (text or "").strip():
                 return TextRoute(action="exit_card_menu", clear_card_mode=True)
             return TextRoute(action="card")
-        clear_from_card = True
+        else:
+            clear_from_card = True
 
     decision = classify_document_intent(
         text,
