@@ -19,10 +19,13 @@
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git
+sudo apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git fonts-dejavu-core
 sudo mkdir -p /opt/pyBot
 sudo chown $USER:$USER /opt/pyBot
 ```
+
+> Карточки маркетплейса рисуют кириллицу через TTF. В репозитории есть `card/fonts/DejaVuSans*.ttf`;
+> `fonts-dejavu-core` — запасной вариант, если шрифты в деплое не скопировались. Без TTF на слайдах будут «квадратики» вместо текста.
 
 Загрузите код (git clone или sftp) в `/opt/pyBot`.
 

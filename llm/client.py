@@ -112,9 +112,11 @@ def generate_product_photo(
             "Camera pulled back enough to see the entire object and its supporting surface. "
             "Believable environment, soft natural light. "
             "Keep product-surface artwork that belongs to the item. "
-            "Do NOT add marketing captions, badges, watermarks, UI, posters or logos around the product. "
+            "CRITICAL: zero text in the image — no letters, words, numbers as captions, "
+            "no callout labels, pills, arrows with text, badges, watermarks, UI, posters or logos. "
+            "Plain photo only; typography is added later in layout. "
             "No people, no hands holding the product, no collage, no multiple unrelated items. "
-            "Forbidden: extreme close-up, cropped rim/base/handle, wrong category."
+            "Forbidden: extreme close-up, cropped rim/base/handle, wrong category, any readable or gibberish text."
         )
     else:
         if has_ref:
@@ -144,10 +146,12 @@ def generate_product_photo(
             "isolated on transparent or seamless light grey / white background, sharp details, centered in frame. "
             "Remove room, table, walls, clutter, people, hands. "
             "Keep product-surface artwork that belongs to the item. "
-            "Do NOT add new titles, badges, watermarks, UI, posters, or marketing captions around the product. "
+            "CRITICAL: zero text in the image — no letters, words, caption bars, callout pills, "
+            "feature labels, badges, watermarks, UI or posters. Typography is added later. "
             "If packaging/book cover has no real branding in the request: blank plain surface. "
             "Forbidden: wrong category, shoes, boots, sneakers, bags, unrelated objects, "
-            "tilted product, dutch angle, collage, multiple items, cropped beyond recognition."
+            "tilted product, dutch angle, collage, multiple items, cropped beyond recognition, "
+            "any readable or gibberish text overlays."
         )
     prompt = "\n".join(parts)
 

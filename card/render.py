@@ -19,15 +19,27 @@ _PALETTES = [
     ("#F5F0EA", "#1C1917", "#FFFFFF", "#D4A574", "#EBE0D4"),
 ]
 
+# Bundled first — works on Linux VPS (Windows paths alone → tofu for Cyrillic).
+_FONTS_DIR = Path(__file__).resolve().parent / "fonts"
 _FONT_REG = [
+    _FONTS_DIR / "DejaVuSans.ttf",
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
     Path(r"C:\Windows\Fonts\segoeui.ttf"),
     Path(r"C:\Windows\Fonts\arial.ttf"),
 ]
 _FONT_BOLD = [
+    _FONTS_DIR / "DejaVuSans-Bold.ttf",
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
     Path(r"C:\Windows\Fonts\segoeuib.ttf"),
     Path(r"C:\Windows\Fonts\arialbd.ttf"),
 ]
 _FONT_SEMI = [
+    _FONTS_DIR / "DejaVuSans-Bold.ttf",
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
     Path(r"C:\Windows\Fonts\seguisb.ttf"),
     Path(r"C:\Windows\Fonts\segoeuib.ttf"),
 ]
@@ -38,7 +50,11 @@ def _font(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont | ImageF
     for path in list(pool) + _FONT_REG:
         if path.exists():
             return ImageFont.truetype(str(path), size)
-    return ImageFont.load_default()
+    # Bitmap default has no Cyrillic — slides become «□□□». Prefer crashing loud in tests.
+    raise FileNotFoundError(
+        "Нет TTF с кириллицей для карточек. Положите DejaVuSans.ttf в card/fonts/ "
+        "или установите fonts-dejavu-core."
+    )
 
 
 # Короткие служебные слова — лучше не оставлять их «висячими» в конце строки
