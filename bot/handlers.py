@@ -64,7 +64,13 @@ from docs.official_forms import (
     get_form,
     match_official_forms,
 )
-from docs.ip_npd_guide import diy_text, first_step, step_by_id
+from docs.ip_npd_guide import (
+    TOCHKA_CLICK_HINT,
+    diy_text,
+    first_step,
+    registration_step_ids,
+    step_by_id,
+)
 from edit.business_docx import render_business_docx, suggest_business_filename
 from edit.docx_patch import (
     apply_patches,
@@ -497,15 +503,15 @@ def _refund(
 
 
 async def _answer_home(message: Message, name: str | None = None) -> None:
-    """Главное меню: inline под приветствием + нижняя клавиатура."""
+    """Главное меню: приветствие + нижняя клавиатура, затем inline-кнопки."""
     await message.answer(
         ui.welcome_text(name),
         parse_mode="HTML",
-        reply_markup=ui.home_inline(),
+        reply_markup=ui.main_reply_keyboard(),
     )
     await message.answer(
-        "Кнопки внизу экрана тоже обновлены.",
-        reply_markup=ui.main_reply_keyboard(),
+        "Выберите раздел:",
+        reply_markup=ui.home_inline(),
     )
 
 
@@ -668,13 +674,13 @@ async def on_menu_callback(query: CallbackQuery) -> None:
             chat_id,
             ui.welcome_text(query.from_user.first_name),
             parse_mode="HTML",
-            reply_markup=ui.home_inline(),
+            reply_markup=ui.main_reply_keyboard(),
         )
         _remember_bot_message(query.from_user.id, sent)
         menu_sent = await query.bot.send_message(
             chat_id,
-            "Кнопки внизу экрана тоже обновлены.",
-            reply_markup=ui.main_reply_keyboard(),
+            "Выберите раздел:",
+            reply_markup=ui.home_inline(),
         )
         _remember_bot_message(query.from_user.id, menu_sent)
         try:
@@ -1647,6 +1653,16 @@ async def _send_ip_npd_step(message: Message, step_id: str) -> None:
         reply_markup=ui.ip_npd_keyboard(step.id),
         disable_web_page_preview=True,
     )
+    # На шаге заявки в Точке — скрин, куда нажать «Оставить заявку»
+    if step.id in registration_step_ids() and TOCHKA_CLICK_HINT.is_file():
+        await message.answer_photo(
+            FSInputFile(TOCHKA_CLICK_HINT),
+            caption=(
+                "После перехода по кнопке на сайте нажмите "
+                "<b>«Оставить заявку»</b> (справа сверху), как на фото."
+            ),
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data.startswith("ipnpd:"))

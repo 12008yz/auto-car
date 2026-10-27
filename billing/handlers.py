@@ -20,7 +20,9 @@ from billing.service import (
     admin_grant_credits,
     admin_grant_pro,
     ensure_user,
+    format_admin_stats,
     fulfill_stars_payment,
+    get_admin_stats,
     get_order,
     get_rail,
 )
@@ -349,6 +351,29 @@ async def on_successful_payment(message: Message) -> None:
         if _lang_ru(lang, "stars")
         else "Payment successful. Balance: /balance"
     )
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    """Admin metrics: users, actions today/7d/all, top users."""
+    if message.from_user is None:
+        return
+    if message.from_user.id not in BILLING_ADMIN_IDS:
+        return
+    text = format_admin_stats(get_admin_stats())
+    # Telegram hard limit ~4096; split if needed.
+    if len(text) <= 4000:
+        await message.answer(text)
+        return
+    chunk = ""
+    for line in text.splitlines(keepends=True):
+        if chunk and len(chunk) + len(line) > 4000:
+            await message.answer(chunk)
+            chunk = line
+        else:
+            chunk += line
+    if chunk:
+        await message.answer(chunk)
 
 
 @router.message(Command("grant"))

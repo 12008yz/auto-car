@@ -15,7 +15,7 @@ import config
 # Подписи нижней клавиатуры (должны совпадать с обработчиками)
 BTN_CARD = "Карточка"
 BTN_DOCS = "Документы"
-BTN_IP_NPD = "ИП на НПД — бесплатно, без деклараций"
+BTN_IP_NPD = "Открыть ИП"
 BTN_BALANCE = "Баланс"
 BTN_PLANS = "Тарифы"
 BTN_HELP = "Помощь"
@@ -36,7 +36,7 @@ BOT_COMMANDS = [
     BotCommand(command="card", description="Собрать карточку WB / Ozon"),
     BotCommand(command="files", description="Мои загруженные файлы"),
     BotCommand(command="summary", description="Краткое содержание файла"),
-    BotCommand(command="ip_npd", description="ИП на НПД — бесплатно"),
+    BotCommand(command="ip_npd", description="Открыть ИП через Точку"),
     BotCommand(command="balance", description="Баланс и лимиты"),
     BotCommand(command="plans", description="Тарифы"),
     BotCommand(command="pay", description="Оплатить тариф"),
@@ -160,22 +160,20 @@ def official_forms_keyboard(form_ids: list[str]) -> InlineKeyboardMarkup:
 
 
 def ip_npd_keyboard(step_id: str) -> InlineKeyboardMarkup:
-    from docs.ip_npd_guide import alfa_url, next_step_id, tochka_url
+    from docs.ip_npd_guide import (
+        gosuslugi_url,
+        my_nalog_url,
+        next_step_id,
+        registration_step_ids,
+        tochka_url,
+    )
 
     rows: list[list[InlineKeyboardButton]] = []
     if step_id == "diy":
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Заявка в Альфе — только ссылка бота",
-                    url=alfa_url(),
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Счёт в Точке — ссылка бота",
+                    text="Точка — партнёрская ссылка бота",
                     url=tochka_url(),
                 )
             ]
@@ -193,13 +191,62 @@ def ip_npd_keyboard(step_id: str) -> InlineKeyboardMarkup:
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    nxt = next_step_id(step_id)
-    if step_id == "alfa":
+    # После объяснения — выбор системы
+    if step_id == "why":
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Заявка в Альфе — только ссылка бота",
-                    url=alfa_url(),
+                    text="НПД", callback_data="ipnpd:step:npd_selfemp"
+                ),
+                InlineKeyboardButton(
+                    text="УСН", callback_data="ipnpd:step:usn_reg"
+                ),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Другое / с менеджером",
+                    callback_data="ipnpd:step:other_reg",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Сделать самому", callback_data="ipnpd:diy"
+                )
+            ]
+        )
+        rows.append(
+            [InlineKeyboardButton(text="« В меню", callback_data="menu:home")]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if step_id == "npd_selfemp":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Госуслуги",
+                    url=gosuslugi_url(),
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Мой налог",
+                    url=my_nalog_url(),
+                )
+            ]
+        )
+
+    if step_id in registration_step_ids() or step_id == "alfa":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Открыть ИП — ссылка бота",
+                    url=tochka_url(),
                 )
             ]
         )
@@ -212,6 +259,8 @@ def ip_npd_keyboard(step_id: str) -> InlineKeyboardMarkup:
                 )
             ]
         )
+
+    nxt = next_step_id(step_id)
     if nxt:
         rows.append(
             [
@@ -282,7 +331,7 @@ def soft_landing_keyboard(*, has_files: bool) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="Меню документов", callback_data="menu:docs"),
-                InlineKeyboardButton(text="ИП на НПД", callback_data="menu:ip_npd"),
+                InlineKeyboardButton(text="Открыть ИП", callback_data="menu:ip_npd"),
             ],
             [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
         ]
@@ -434,10 +483,10 @@ def help_text() -> str:
         "• создать: бланк, реферат, письмо, претензия, КП\n"
         "• деловые черновики: договор · акт · счёт · претензия · письмо\n"
         "• официальные бланки ФНС: «официальный бланк Р21001», «декларация УСН»\n\n"
-        f"<b>ИП на НПД</b>\n"
+        f"<b>Открыть ИП</b>\n"
         f"Кнопка «{BTN_IP_NPD}» в меню, раздел «Документы» "
         "или команда /ip_npd.\n"
-        "Бесплатный мастер: Альфа → Точка → проверка НПД. "
+        "Бесплатный мастер через Точка Банк: заявка → счёт → проверка налога. "
         "Бот не подаёт заявку за вас — только ведёт по шагам.\n\n"
         "Форматы: Word · PDF · Excel · PowerPoint · TXT · MD · CSV\n"
         f"{billing_line}\n\n"

@@ -238,6 +238,38 @@ def _credits_ru(n: int) -> str:
     return f"{n} {word}"
 
 
+# usage_daily column names (write is quoted — SQL reserved word)
+_USAGE_COL: dict[Action, str] = {
+    "ask": "ask",
+    "summary": "summary",
+    "card": "card",
+    "write": '"write"',
+    "edit": "edit",
+}
+
+
+def _record_usage_conn(
+    conn: Any, telegram_id: int, action: Action, day: str | None = None
+) -> None:
+    col = _USAGE_COL[action]
+    d = day or _today()
+    conn.execute(
+        f"INSERT INTO usage_daily (telegram_id, day, {col}) VALUES (?, ?, 1) "
+        f"ON CONFLICT(telegram_id, day) DO UPDATE SET {col} = {col} + 1",
+        (telegram_id, d),
+    )
+
+
+def record_usage(
+    telegram_id: int, action: Action, day: str | None = None
+) -> None:
+    """Increment usage_daily for an action (tests / backfill)."""
+    _ensure_init()
+    with _lock, connect() as conn:
+        _record_usage_conn(conn, telegram_id, action, day=day)
+        conn.commit()
+
+
 def consume(telegram_id: int, action: Action, language_code: str | None = None) -> ConsumeResult:
     ensure_user(telegram_id, language_code)
     if _config.BILLING_OPEN_ACCESS:
@@ -270,6 +302,7 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
                     f"UPDATE wallets SET {col} = {col} + 1 WHERE telegram_id = ?",
                     (telegram_id,),
                 )
+                _record_usage_conn(conn, telegram_id, action)
                 conn.commit()
                 return ConsumeResult(ok=True, charged="daily", amount=0)
 
@@ -279,6 +312,7 @@ def consume(telegram_id: int, action: Action, language_code: str | None = None) 
                 "UPDATE wallets SET credits_balance = credits_balance - ? WHERE telegram_id = ?",
                 (cost, telegram_id),
             )
+            _record_usage_conn(conn, telegram_id, action)
             conn.commit()
             return ConsumeResult(ok=True, charged="credits", amount=cost)
 
@@ -331,6 +365,7 @@ def _bump_daily_counter(telegram_id: int, action: Action) -> None:
             f"UPDATE wallets SET {col} = {col} + 1 WHERE telegram_id = ?",
             (telegram_id,),
         )
+        _record_usage_conn(conn, telegram_id, action)
         conn.commit()
 
 
@@ -503,6 +538,183 @@ def grant_order(
             (order_id,),
         ).fetchone()
         return {"ok": True, "duplicate": False, "order": dict(refreshed), "sku": sku}
+
+
+@dataclass
+class ActionCounts:
+    ask: int = 0
+    summary: int = 0
+    card: int = 0
+    write: int = 0
+    edit: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.ask + self.summary + self.card + self.write + self.edit
+
+
+@dataclass
+class TopUser:
+    telegram_id: int
+    counts: ActionCounts
+
+
+@dataclass
+class PeriodStats:
+    actions: ActionCounts
+    active_users: int
+    top: list[TopUser]
+
+
+@dataclass
+class AdminStats:
+    users_total: int
+    users_new_today: int
+    today: PeriodStats
+    days7: PeriodStats
+    all_time: PeriodStats
+    paid_orders: int
+
+
+def _counts_from_row(row: Any) -> ActionCounts:
+    if row is None:
+        return ActionCounts()
+    return ActionCounts(
+        ask=int(row["ask"] or 0),
+        summary=int(row["summary"] or 0),
+        card=int(row["card"] or 0),
+        write=int(row["write"] or 0),
+        edit=int(row["edit"] or 0),
+    )
+
+
+def _period_stats(
+    conn: Any, *, day_from: str | None, day_to: str | None, top_n: int
+) -> PeriodStats:
+    where = []
+    params: list[Any] = []
+    if day_from is not None:
+        where.append("day >= ?")
+        params.append(day_from)
+    if day_to is not None:
+        where.append("day <= ?")
+        params.append(day_to)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+    sums = conn.execute(
+        "SELECT COALESCE(SUM(ask),0) AS ask, COALESCE(SUM(summary),0) AS summary, "
+        'COALESCE(SUM(card),0) AS card, COALESCE(SUM("write"),0) AS "write", '
+        "COALESCE(SUM(edit),0) AS edit "
+        f"FROM usage_daily{clause}",
+        params,
+    ).fetchone()
+    actions = _counts_from_row(sums)
+
+    active_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM ("
+        "SELECT telegram_id FROM usage_daily"
+        f"{clause} "
+        'GROUP BY telegram_id '
+        'HAVING SUM(ask+summary+card+"write"+edit) > 0'
+        ")",
+        params,
+    ).fetchone()
+    active_users = int(active_row["n"] if active_row else 0)
+
+    top_rows = conn.execute(
+        "SELECT telegram_id, "
+        "SUM(ask) AS ask, SUM(summary) AS summary, SUM(card) AS card, "
+        'SUM("write") AS "write", SUM(edit) AS edit, '
+        'SUM(ask+summary+card+"write"+edit) AS total '
+        f"FROM usage_daily{clause} "
+        "GROUP BY telegram_id "
+        "HAVING total > 0 "
+        "ORDER BY total DESC, telegram_id ASC "
+        "LIMIT ?",
+        [*params, top_n],
+    ).fetchall()
+    top = [
+        TopUser(telegram_id=int(r["telegram_id"]), counts=_counts_from_row(r))
+        for r in top_rows
+    ]
+    return PeriodStats(actions=actions, active_users=active_users, top=top)
+
+
+def get_admin_stats(top_n: int = 10) -> AdminStats:
+    """Aggregate users + usage_daily for admin /stats."""
+    _ensure_init()
+    today = _today()
+    day_7 = (_now().date() - timedelta(days=6)).isoformat()
+    with _lock, connect() as conn:
+        users_total = int(
+            conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        )
+        users_new_today = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM users WHERE created_at >= ?",
+                (today,),
+            ).fetchone()["n"]
+        )
+        paid_orders = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM orders WHERE status = 'paid'"
+            ).fetchone()["n"]
+        )
+        today_stats = _period_stats(conn, day_from=today, day_to=today, top_n=top_n)
+        days7 = _period_stats(conn, day_from=day_7, day_to=today, top_n=top_n)
+        all_time = _period_stats(conn, day_from=None, day_to=None, top_n=top_n)
+    return AdminStats(
+        users_total=users_total,
+        users_new_today=users_new_today,
+        today=today_stats,
+        days7=days7,
+        all_time=all_time,
+        paid_orders=paid_orders,
+    )
+
+
+def _fmt_actions(c: ActionCounts) -> str:
+    parts = []
+    if c.ask:
+        parts.append(f"ask:{c.ask}")
+    if c.summary:
+        parts.append(f"summary:{c.summary}")
+    if c.card:
+        parts.append(f"card:{c.card}")
+    if c.write:
+        parts.append(f"write:{c.write}")
+    if c.edit:
+        parts.append(f"edit:{c.edit}")
+    detail = " ".join(parts) if parts else "—"
+    return f"{c.total} ({detail})"
+
+
+def _fmt_top(title: str, users: list[TopUser]) -> str:
+    if not users:
+        return f"{title}\n(none)"
+    lines = [title]
+    for i, u in enumerate(users, 1):
+        lines.append(f"{i}. id={u.telegram_id} — {_fmt_actions(u.counts)}")
+    return "\n".join(lines)
+
+
+def format_admin_stats(stats: AdminStats) -> str:
+    t, w, a = stats.today, stats.days7, stats.all_time
+    blocks = [
+        f"Users: {stats.users_total} (new today: {stats.users_new_today})",
+        f"Active: today {t.active_users} | 7d {w.active_users}",
+        f"Actions today: {_fmt_actions(t.actions)}",
+        f"Actions 7d: {_fmt_actions(w.actions)}",
+        f"Actions all: {_fmt_actions(a.actions)}",
+        f"Paid orders: {stats.paid_orders}",
+        "",
+        _fmt_top("Top today:", t.top),
+        "",
+        _fmt_top("Top 7d:", w.top),
+        "",
+        _fmt_top("Top all:", a.top),
+    ]
+    return "\n".join(blocks)
 
 
 def admin_grant_credits(telegram_id: int, credits: int, language_code: str | None = None) -> None:

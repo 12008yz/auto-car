@@ -157,7 +157,7 @@ async def page_home(_request: web.Request) -> web.Response:
     <h1>{brand}</h1>
     <p>Telegram-бот для работы с документами и карточками маркетплейсов:
     вопросы по файлам, краткое содержание, создание и правка Word,
-    карточки товара WB/Ozon, гид «ИП на НПД».</p>
+    карточки товара WB/Ozon, гид «Открыть ИП».</p>
     <p>
       <a class="btn" href="{bot}" target="_blank" rel="noopener">Открыть бота</a>
       <a class="btn" href="/order" style="margin-left:.4rem;background:#14532d">Оформить заказ</a>

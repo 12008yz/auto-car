@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS dialog_sessions (
     payload TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS usage_daily (
+    telegram_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    ask INTEGER NOT NULL DEFAULT 0,
+    summary INTEGER NOT NULL DEFAULT 0,
+    card INTEGER NOT NULL DEFAULT 0,
+    "write" INTEGER NOT NULL DEFAULT 0,
+    edit INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (telegram_id, day)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_daily_day ON usage_daily(day);
 """
 
 
